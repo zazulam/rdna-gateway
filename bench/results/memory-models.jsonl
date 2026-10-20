@@ -1,0 +1,4 @@
+{"host": "desktop", "label": "gemma4-12b", "phase": "loaded", "vram_mib": 8834, "rss_mib": 7014}
+{"host": "desktop", "label": "lfm2.5-8b-a1b", "phase": "loaded", "vram_mib": 6405, "rss_mib": 5234}
+{"host": "desktop", "label": "gpt-oss-20b", "phase": "loaded", "vram_mib": 12918, "rss_mib": 11305}
+{"host": "desktop", "label": "qwen3.6-35b-a3b", "phase": "loaded", "vram_mib": 15316, "rss_mib": 14336}

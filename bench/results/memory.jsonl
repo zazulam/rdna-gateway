@@ -1,0 +1,40 @@
+{"host": "desktop", "label": "4x8k q8_0", "phase": "idle", "vram_mib": 9008, "rss_mib": 6928}
+{"host": "desktop", "label": "4x8k q8_0", "phase": "loaded", "vram_mib": 9228, "rss_mib": 15546}
+{"host": "server", "label": "4x8k q8_0", "phase": "idle", "vram_mib": 8757, "rss_mib": 1330}
+{"host": "server", "label": "4x8k q8_0", "phase": "loaded", "vram_mib": 8873, "rss_mib": 9434}
+{"host": "desktop", "label": "4x32k q8_0", "phase": "idle", "vram_mib": 10021, "rss_mib": 6956}
+{"host": "desktop", "label": "4x32k q8_0", "phase": "loaded", "vram_mib": 10253, "rss_mib": 18231}
+{"host": "desktop", "label": "2x32k cache-ram 0", "phase": "idle", "vram_mib": 8834, "rss_mib": 7013}
+{"host": "desktop", "label": "2x32k cache-ram 0", "phase": "loaded", "vram_mib": 721, "rss_mib": 0}
+{"host": "desktop", "label": "2x32k cache-ram 32G", "phase": "idle", "vram_mib": 721, "rss_mib": 0}
+{"host": "desktop", "label": "2x32k cache-ram 32G", "phase": "loaded", "vram_mib": 3060, "rss_mib": 206}
+{"host": "server", "label": "4x8k q8_0", "phase": "idle", "vram_mib": 8469, "rss_mib": 1328}
+{"host": "server", "label": "4x8k q8_0", "phase": "loaded", "vram_mib": 8628, "rss_mib": 7490}
+{"host": "server", "label": "2x32k q8_0", "phase": "idle", "vram_mib": 8319, "rss_mib": 1352}
+{"host": "server", "label": "2x32k q8_0", "phase": "loaded", "vram_mib": 8431, "rss_mib": 7929}
+{"host": "server", "label": "4x32k q8_0", "phase": "idle", "vram_mib": 9499, "rss_mib": 1357}
+{"host": "server", "label": "4x32k q8_0", "phase": "loaded", "vram_mib": 9663, "rss_mib": 13348}
+{"host": "server", "label": "2x32k f16", "phase": "idle", "vram_mib": 9176, "rss_mib": 1348}
+{"host": "server", "label": "2x32k f16", "phase": "loaded", "vram_mib": 9333, "rss_mib": 12092}
+{"host": "server", "label": "2x32k q4_0", "phase": "idle", "vram_mib": 7824, "rss_mib": 1352}
+{"host": "server", "label": "2x32k q4_0", "phase": "loaded", "vram_mib": 7933, "rss_mib": 4850}
+{"host": "server", "label": "2x32k cache-ram 0", "phase": "idle", "vram_mib": 8319, "rss_mib": 1352}
+{"host": "server", "label": "2x32k cache-ram 0", "phase": "loaded", "vram_mib": 8428, "rss_mib": 2746}
+{"host": "server", "label": "2x32k cache-ram 32G", "phase": "idle", "vram_mib": 8319, "rss_mib": 1352}
+{"host": "server", "label": "2x32k cache-ram 32G", "phase": "loaded", "vram_mib": 8475, "rss_mib": 7929}
+{"host": "desktop", "label": "4x8k q8_0", "phase": "idle", "vram_mib": 8985, "rss_mib": 6928}
+{"host": "desktop", "label": "4x8k q8_0", "phase": "loaded", "vram_mib": 9274, "rss_mib": 15030}
+{"host": "desktop", "label": "2x32k q8_0", "phase": "idle", "vram_mib": 8834, "rss_mib": 7014}
+{"host": "desktop", "label": "2x32k q8_0", "phase": "loaded", "vram_mib": 8991, "rss_mib": 13589}
+{"host": "desktop", "label": "4x32k q8_0", "phase": "idle", "vram_mib": 10021, "rss_mib": 6957}
+{"host": "desktop", "label": "4x32k q8_0", "phase": "loaded", "vram_mib": 10251, "rss_mib": 15059}
+{"host": "desktop", "label": "2x32k f16", "phase": "idle", "vram_mib": 9696, "rss_mib": 7009}
+{"host": "desktop", "label": "2x32k f16", "phase": "loaded", "vram_mib": 10018, "rss_mib": 17752}
+{"host": "desktop", "label": "2x32k q4_0", "phase": "idle", "vram_mib": 8336, "rss_mib": 7014}
+{"host": "desktop", "label": "2x32k q4_0", "phase": "loaded", "vram_mib": 8493, "rss_mib": 10509}
+{"host": "desktop", "label": "2x32k swa-full", "phase": "idle", "vram_mib": 16078, "rss_mib": 9991}
+{"host": "desktop", "label": "2x32k swa-full", "phase": "loaded", "vram_mib": 16154, "rss_mib": 10444}
+{"host": "desktop", "label": "2x32k cache-ram 0", "phase": "idle", "vram_mib": 8834, "rss_mib": 7014}
+{"host": "desktop", "label": "2x32k cache-ram 0", "phase": "loaded", "vram_mib": 9080, "rss_mib": 8405}
+{"host": "desktop", "label": "2x32k cache-ram 32G", "phase": "idle", "vram_mib": 8834, "rss_mib": 7013}
+{"host": "desktop", "label": "2x32k cache-ram 32G", "phase": "loaded", "vram_mib": 8991, "rss_mib": 13588}

@@ -1,0 +1,360 @@
+# Hardware-health and availability alerts, sent to ntfy (see docker-compose.yml).
+# Thresholds sit below the cards' own limits: RDNA2 throttles at 110 °C
+# junction and its GDDR6 is rated to 105 °C (from the amdgpu hwmon crit values).
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: ntfy
+    receivers:
+      - uid: ntfy
+        type: webhook
+        settings:
+          # ntfy templates the push from Grafana's JSON body.
+          url: ${NTFY_URL}/${NTFY_TOPIC}?tpl=yes&t=%7B%7B.title%7D%7D&m=%7B%7B.message%7D%7D
+          httpMethod: POST
+
+policies:
+  - orgId: 1
+    receiver: ntfy
+    group_by: [alertname]
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
+
+groups:
+  - orgId: 1
+    name: hardware
+    folder: rdna
+    interval: 30s
+    rules:
+      - &rule
+        uid: gpu-junction-warm
+        title: GPU junction above 95 °C
+        condition: C
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: The GPU hotspot has been above 95 °C for 10 minutes. Check airflow and dust; sustained load is fine, but this is close to the 110 °C throttle point.
+        noDataState: OK
+        execErrState: Error
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max(node_hwmon_temp_celsius * on (chip, sensor) group_left (label) node_hwmon_sensor_label{label="junction"})
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions: [{evaluator: {type: gt, params: [95]}}]
+      - <<: *rule
+        uid: gpu-junction-hot
+        title: GPU junction above 103 °C
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: The GPU hotspot is above 103 °C (throttles at 110). Stop the load or check the fan now.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max(node_hwmon_temp_celsius * on (chip, sensor) group_left (label) node_hwmon_sensor_label{label="junction"})
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [103]}}]}
+      - <<: *rule
+        uid: gpu-mem-warm
+        title: GPU memory above 92 °C
+        annotations:
+          summary: GDDR6 has been above 92 °C for 10 minutes (rated to 105). Long model-serving runs load memory hardest.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max(node_hwmon_temp_celsius * on (chip, sensor) group_left (label) node_hwmon_sensor_label{label="mem"})
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [92]}}]}
+      - <<: *rule
+        uid: gpu-mem-hot
+        title: GPU memory above 100 °C
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: GDDR6 is above 100 °C (rated to 105). Stop the load or check the fan now.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max(node_hwmon_temp_celsius * on (chip, sensor) group_left (label) node_hwmon_sensor_label{label="mem"})
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [100]}}]}
+      - <<: *rule
+        uid: gpu-fan-stalled
+        title: GPU fan stopped under load
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: The GPU fan reads 0 rpm while the card draws over 60 W.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: count((node_hwmon_fan_rpm == 0) and on (chip) (node_hwmon_power_average_watt > 60))
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [0]}}]}
+      - <<: *rule
+        uid: cpu-hot
+        title: CPU above 90 °C
+        for: 5m
+        annotations:
+          summary: The CPU (Tctl) has been above 90 °C for 5 minutes (Ryzen 7000 limit is 95).
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max(node_hwmon_temp_celsius * on (chip, sensor) group_left (label) node_hwmon_sensor_label{label="Tctl"})
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [90]}}]}
+      - <<: *rule
+        uid: vrm-hot
+        title: Motherboard VRM above 100 °C
+        for: 5m
+        annotations:
+          summary: The CPU voltage regulators have been above 100 °C for 5 minutes. Small cases run these hot; check case airflow.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: max(node_hwmon_temp_celsius * on (chip, sensor) group_left (label) node_hwmon_sensor_label{label="VRM"})
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [100]}}]}
+      - <<: *rule
+        uid: desktop-gpu-warm
+        title: Desktop GPU hotspot above 95 °C
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: The 6900 XT hotspot has been above 95 °C for 10 minutes (throttles at 110). Check case airflow and dust.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: 'max(lhm_gpuamd_temperature_celsius{sensorName="GPU Hot Spot"})'
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [95]}}]}
+      - <<: *rule
+        uid: desktop-gpu-hot
+        title: Desktop GPU hotspot above 103 °C
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: The 6900 XT hotspot is above 103 °C. Stop the load or check the fans now.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: 'max(lhm_gpuamd_temperature_celsius{sensorName="GPU Hot Spot"})'
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [103]}}]}
+      - <<: *rule
+        uid: desktop-gpu-fan
+        title: Desktop GPU fan stopped under load
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: The 6900 XT fan reads 0 rpm while the card draws over 80 W (zero-RPM idle is normal below that).
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: 'count((lhm_gpuamd_fan_rpm{sensorName="GPU Fan"} == 0) and on (host) (lhm_gpuamd_power_watts{sensorName="GPU Package"} > 80))'
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [0]}}]}
+      - <<: *rule
+        uid: desktop-cpu-hot
+        title: Desktop CPU above 85 °C
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: The 5950X has been above 85 °C for 5 minutes (limit 90).
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: 'max(lhm_cpu_temperature_celsius{sensorName="Core (Tctl/Tdie)"})'
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [85]}}]}
+      - <<: *rule
+        uid: jetson-warm
+        title: Jetson junction above 85 °C
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: The Jetson has been above 85 °C for 10 minutes (throttles near 99). Check its fan and airflow.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: 'max(jetson_temp_celsius{zone="tj"})'
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [85]}}]}
+      - <<: *rule
+        uid: jetson-hot
+        title: Jetson junction above 95 °C
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: The Jetson is above 95 °C and close to throttling.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: 'max(jetson_temp_celsius{zone="tj"})'
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [95]}}]}
+      - <<: *rule
+        uid: jetson-memory
+        title: Jetson memory above 95%
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: The Jetson's shared memory is nearly full; the embedder or reranker may be killed.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: '100 * (1 - node_memory_MemAvailable_bytes{host="jetson"} / node_memory_MemTotal_bytes{host="jetson"})'
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [95]}}]}
+      - <<: *rule
+        uid: jetson-sensors-stale
+        title: Jetson temperature script not reporting
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: jetson-sensors.service isn't writing temperatures (node_exporter is up but the textfile is missing).
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: 'count(jetson_temp_celsius) or vector(0)'
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: lt, params: [1]}}]}
+
+  - orgId: 1
+    name: availability
+    folder: rdna
+    interval: 1m
+    rules:
+      - <<: *rule
+        uid: disk-low
+        title: Disk under 10% free
+        for: 10m
+        annotations:
+          summary: The server's root disk has under 10% free (models, Prometheus and Qdrant live there).
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: 100 * min(node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"})
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: lt, params: [10]}}]}
+      - <<: *rule
+        uid: worker-down
+        title: Inference worker down
+        for: 5m
+        annotations:
+          summary: A gateway worker has failed health checks for 5 minutes (the desktop being off or asleep also triggers this).
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: count(rdnagw_worker_up == 0)
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [0]}}]}
+      - <<: *rule
+        uid: scrape-down
+        title: Monitoring target down
+        for: 5m
+        annotations:
+          summary: Prometheus can't reach one of its targets (gateway, a worker, the MCP server, Qdrant or node_exporter).
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: count(up == 0)
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [0]}}]}

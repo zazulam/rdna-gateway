@@ -1,0 +1,203 @@
+# Side services for an always-on Linux worker box: monitoring, a CPU model,
+# retrieval (embeddings, reranker, Qdrant), web search, and agent tools (MCP).
+# The GPU worker itself stays a systemd unit (workers/linux/install.sh).
+#
+#   cp .env.example .env && $EDITOR .env
+#   ./up.sh
+#
+# Prometheus, node_exporter, Qdrant and SearXNG listen on loopback only;
+# Grafana, the model servers and the MCP endpoint on BIND_IP (Tailscale).
+name: rdna-sff
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    network_mode: host
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${RETENTION:-90d}
+      - --web.listen-address=127.0.0.1:9090
+    volumes:
+      - ./prometheus/prometheus.gen.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules.gen.yml:/etc/prometheus/rules.yml:ro
+      - prometheus:/prometheus
+
+  grafana:
+    image: grafana/grafana:13.2.4
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      GF_SERVER_HTTP_ADDR: ${BIND_IP}
+      GF_SERVER_HTTP_PORT: "3000"
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/inference.json
+      # Used by provisioning/alerting/rdna.yml.
+      NTFY_URL: http://${BIND_IP}:8095
+      NTFY_TOPIC: ${NTFY_TOPIC:?set NTFY_TOPIC in .env}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana:/var/lib/grafana
+
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    network_mode: host
+    pid: host
+    restart: unless-stopped
+    command:
+      - --path.rootfs=/host
+      - --web.listen-address=127.0.0.1:9101 # :9100 is taken by k3s's Traefik
+      - --collector.drm # amdgpu busy %, VRAM
+    volumes:
+      - /:/host:ro,rslave
+
+  # A small MoE model on the CPU for quick jobs (titles, classification), so they
+  # don't take a GPU slot. Add it to the gateway as another worker.
+  llama-cpu:
+    image: ghcr.io/ggml-org/llama.cpp:server@sha256:143926008cbbbab8fae8fd87809875af3e42d3d676c30c11c55c0f3f683a5a07 # b11723
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ${MODELS_DIR}:/models:ro
+    command:
+      - -m
+      - /models/${CPU_MODEL}
+      - --alias
+      - ${CPU_ALIAS}
+      - --host
+      - ${BIND_IP}
+      - --port
+      - "8082"
+      - -t
+      - ${CPU_THREADS:-5}
+      - -c
+      - ${CPU_CTX:-32768}
+      - --parallel
+      - ${CPU_SLOTS:-2}
+      - --cache-reuse
+      - "256"
+      - --metrics
+      - --jinja
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://${BIND_IP}:8082/health"]
+      interval: 30s
+      timeout: 5s
+
+  # Retrieval runs the embedder and reranker on the GPU next to the worker
+  # (workers/linux/install.sh aux): 15x faster than this CPU. These CPU
+  # versions are a fallback for a box without spare VRAM:
+  #   docker compose --profile cpu-retrieval up -d   (and point EMBED_URL/RERANK_URL at them)
+  embed:
+    profiles: [cpu-retrieval]
+    image: ghcr.io/ggml-org/llama.cpp:server@sha256:143926008cbbbab8fae8fd87809875af3e42d3d676c30c11c55c0f3f683a5a07
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ${MODELS_DIR}:/models:ro
+    command: [-m, "/models/${EMBED_MODEL_FILE}", --alias, "${EMBED_ALIAS}", --embedding, --pooling, "${EMBED_POOLING:-last}",
+              --host, "${BIND_IP}", --port, "8083", -t, "${EMBED_THREADS:-4}", -c, "8192", -b, "2048", -ub, "2048",
+              --parallel, "4", --metrics]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://${BIND_IP}:8083/health"]
+      interval: 30s
+      timeout: 5s
+
+  rerank:
+    profiles: [cpu-retrieval]
+    image: ghcr.io/ggml-org/llama.cpp:server@sha256:143926008cbbbab8fae8fd87809875af3e42d3d676c30c11c55c0f3f683a5a07
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ${MODELS_DIR}:/models:ro
+    command: [-m, "/models/${RERANK_MODEL_FILE}", --alias, "${RERANK_ALIAS}", --reranking,
+              --host, "${BIND_IP}", --port, "8084", -t, "${RERANK_THREADS:-4}", -c, "8192", -b, "2048", -ub, "2048",
+              --parallel, "4", --metrics]
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://${BIND_IP}:8084/health"]
+      interval: 30s
+      timeout: 5s
+
+  qdrant:
+    image: qdrant/qdrant:v1.19.2
+    restart: unless-stopped
+    ports: ["127.0.0.1:6333:6333"]
+    environment:
+      QDRANT__TELEMETRY_DISABLED: "true"
+    volumes:
+      - qdrant:/qdrant/storage
+
+  searxng:
+    image: searxng/searxng:2026.10.17-1c10abe2d
+    restart: unless-stopped
+    ports: ["127.0.0.1:8888:8080"]
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?set SEARXNG_SECRET in .env}
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+
+  # Agent tools over MCP (Streamable HTTP) at http://BIND_IP:8090/mcp, bearer
+  # RDNAMCP_TOKEN. Build the binary first: see up.sh.
+  mcp:
+    image: gcr.io/distroless/static-debian12:nonroot
+    network_mode: host
+    restart: unless-stopped
+    entrypoint: ["/rdnamcp", "serve"]
+    volumes:
+      - ./bin/rdnamcp:/rdnamcp:ro
+      # Read-only: lab_dashboard lists these panels and their queries.
+      - ./grafana/dashboards:/dashboards:ro
+    environment:
+      RDNAMCP_LISTEN: ${BIND_IP}:8090
+      PROMETHEUS_URL: http://127.0.0.1:9090
+      GRAFANA_DASHBOARDS: /dashboards
+      RDNAMCP_TOKEN: ${RDNAMCP_TOKEN:?set RDNAMCP_TOKEN in .env}
+      SEARXNG_URL: http://127.0.0.1:8888
+      QDRANT_URL: http://127.0.0.1:6333
+      EMBED_URL: ${EMBED_URL:-http://${BIND_IP}:8083}
+      EMBED_MODEL: ${EMBED_ALIAS}
+      RERANK_URL: ${RERANK_URL:-http://${BIND_IP}:8084}
+      RERANK_MODEL: ${RERANK_ALIAS}
+      RERANK_CANDIDATES: ${RERANK_CANDIDATES:-20}
+
+  # Push notifications for Grafana alerts. Subscribe in the ntfy phone app to
+  # http://BIND_IP:8095/NTFY_TOPIC (the phone needs Tailscale). Message bodies
+  # stay here; for iOS instant delivery ntfy.sh relays only a wake-up poll.
+  ntfy:
+    image: binwiederhier/ntfy:v2.32.0
+    network_mode: host
+    restart: unless-stopped
+    command: [serve]
+    environment:
+      NTFY_LISTEN_HTTP: ${BIND_IP}:8095
+      NTFY_BASE_URL: http://${BIND_IP}:8095
+      NTFY_CACHE_FILE: /var/cache/ntfy/cache.db
+      NTFY_CACHE_DURATION: 72h
+      NTFY_UPSTREAM_BASE_URL: https://ntfy.sh
+    volumes:
+      - ntfy:/var/cache/ntfy
+
+  # Enphase IQ Gateway (solar, house consumption, grid import/export) as metrics.
+  # Needs an owner token in secrets/envoy.token (see .env.example).
+  envoy:
+    image: gcr.io/distroless/static-debian12:nonroot
+    network_mode: host
+    restart: unless-stopped
+    user: "${UID_GID:-1000:1000}" # the token file is readable by its owner only
+    entrypoint: ["/envoyexporter"]
+    volumes:
+      - ./bin/envoyexporter:/envoyexporter:ro
+      - ./secrets:/secrets:ro
+    environment:
+      ENVOY_URL: ${ENVOY_URL:-https://envoy.local}
+      ENVOY_TOKEN_FILE: /secrets/envoy.token
+      LISTEN: 127.0.0.1:9110
+
+volumes:
+  ntfy:
+  prometheus:
+  grafana:
+  qdrant:
