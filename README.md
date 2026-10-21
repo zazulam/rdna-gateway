@@ -203,6 +203,7 @@ The `deploy/sff` stack adds, on one Linux box:
 - **Monitoring:** Prometheus and a Grafana dashboard covering workers, tokens/s, prompt
   cache hit rate, slots and queue, routing, agent tool calls, hardware health (GPU, CPU,
   VRM, RAM and NVMe temperatures, power, fans) and energy cost.
+
   ![The Grafana dashboard's pool row: workers up, tokens per second, prompt cache hit rate, gateway requests, slots and routing decisions](docs/img/grafana-pool.png)
 
 - **Alerts** for heat, stalled fans, low disk and workers going down, pushed to your phone
