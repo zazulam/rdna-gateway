@@ -256,6 +256,21 @@ npx @marp-team/marp-cli docs/deck/rdna2-benchmarks.md --pdf --allow-local-files
 Raw results are in `bench/results/*.jsonl`; every table is in
 [bench/results/tables.md](bench/results/tables.md).
 
+## Future work
+
+Ideas for **longer contexts without slowing everything else down**. None of these are
+measured yet; each would get a benchmark before becoming a default.
+
+| Idea | Why it could help |
+|---|---|
+| **Length-aware routing to mixed slot sizes** | Most requests are short. Run most slots at 32k and one long-context slot per card (a second llama-server instance, or `--kv-unified-per-slot` on newer builds), and have the gateway route by estimated prompt length, so only long requests pay long-context costs. `--kv-unified` measured 2.3× slower on older builds, so that needs re-testing. |
+| **q4_0 KV for the long slots** | KV cache type cost no speed on ROCm, and q4_0 roughly halves the cache's VRAM compared with q8_0, so about twice the context fits. The needle and recall benchmarks would show whether quality holds. |
+| **Count resident sessions per slot** | The routing benchmarks showed prefix affinity overloading a warm card. Routing by sessions held, not just requests in flight, keeps long conversations cached instead of evicted. |
+| **Speculative decoding** | The build has n-gram modes that need no second model and suit agents that repeat code and file contents, plus draft-model modes. Either could raise decode speed, which is what drops as context grows. |
+| **Favour sliding-window and hybrid-attention models** | gemma4 and gpt-oss keep most of their cache to a fixed window, which is why 4×32k fits under 10 GB. Their cache grows far more slowly than a fully dense model's. |
+| **Move context between workers** | Instead of re-processing a long conversation when it moves to another card, copy its KV cache across. That allows draining, rebalancing, promoting a session to a bigger slot, and parking idle sessions on disk. [The plan](docs/CONTEXT-MIGRATION.md). |
+| **Retrieve and compact rather than stretch the window** | Already measured: five retrieved passages matched handing over the right file at a fifth of the tokens, and compaction kept recall at 100% for the larger models. Often the best "long context" is a shorter one. |
+
 ## Caveats
 
 This is one person's home lab, published in case it helps others with the same hardware.
