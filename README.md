@@ -17,6 +17,8 @@ You can use it three ways:
 - **Pool several machines** behind one endpoint, with failover, routing, monitoring and
   optional agent tools (web search, document retrieval, memory) over MCP.
 
+![Service architecture: clients call one gateway, which routes to llama.cpp workers on two GPUs, a CPU and a Jetson; Prometheus and Grafana watch everything](docs/img/homelab-services.svg)
+
 ## What we learned
 
 The numbers are from this repo's own harness ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)).
@@ -31,6 +33,16 @@ The numbers are from this repo's own harness ([docs/BENCHMARKS.md](docs/BENCHMAR
 | **Run 4 slots × 32k context per card** | Best total throughput (62 vs 53 tok/s with 2 slots), under 10 GB of VRAM. [More](docs/BENCHMARKS.md#serving-one-card) |
 | **Prefer small MoE models** | gpt-oss 20B ran 2.2× faster than dense gemma4 12B (2866 / 119 tok/s prefill / decode) with perfect needle recall. A 35B MoE fits a 16 GB card with `--n-cpu-moe 16` (37 tok/s). [More](docs/BENCHMARKS.md#dense-vs-moe) |
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/dark/micro-prefill.svg">
+  <img alt="Prefill throughput by prompt length: ROCm holds 1,100 to 1,400 tokens/s on the 6900 XT while Vulkan falls from about 900 to 69" src="docs/img/micro-prefill.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/dark/moe-speed.svg">
+  <img alt="Decode and prefill speed per model on each card: the MoE models (LFM2.5, gpt-oss) are several times faster than dense gemma4 12B" src="docs/img/moe-speed.svg">
+</picture>
+
 ### Serving agents
 
 | Do this | Because |
@@ -41,6 +53,16 @@ The numbers are from this repo's own harness ([docs/BENCHMARKS.md](docs/BENCHMAR
 | **Route by load, not round-robin** | With two different cards, round-robin was up to 2× slower; least-loaded won on long contexts. [More](docs/BENCHMARKS.md#routing-across-two-cards) |
 | **Use a slow machine only as a fallback** | The MacBook added nothing to the pool, but served everything when both GPU boxes were down. |
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/dark/context-ttft.svg">
+  <img alt="Time to first token as context grows: with the prefix cached it stays under a second up to 16k tokens; without it, it climbs to 14 seconds" src="docs/img/context-ttft.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/dark/routing.svg">
+  <img alt="Routing policies across two cards: round-robin has the lowest throughput, especially with long contexts; least-loaded is best" src="docs/img/routing.svg">
+</picture>
+
 ### Agent tools and retrieval
 
 | Finding | Detail |
@@ -50,6 +72,11 @@ The numbers are from this repo's own harness ([docs/BENCHMARKS.md](docs/BENCHMAR
 | **Always rerank** | A cross-encoder over the top 20 hits added 15 points of first-place accuracy. |
 | **A Jetson makes a good retrieval node** | At 16 W it runs the embedder and reranker, freeing the GPU for a bigger chat model. [More](docs/BENCHMARKS.md#jetson-orin-nano-super-as-the-retrieval-node) |
 | **Tiny CPU models handle quick jobs** | LFM2 8B-A1B writes titles and routes requests in 0.2–0.4 s on a desktop CPU. |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/dark/rag-e2e.svg">
+  <img alt="Answer accuracy, prompt tokens and time: the top 5 retrieved passages match the right file's accuracy with far fewer tokens and much less time than pasting the docs" src="docs/img/rag-e2e.svg">
+</picture>
 
 ## What's here
 
@@ -176,6 +203,8 @@ The `deploy/sff` stack adds, on one Linux box:
 - **Monitoring:** Prometheus and a Grafana dashboard covering workers, tokens/s, prompt
   cache hit rate, slots and queue, routing, agent tool calls, hardware health (GPU, CPU,
   VRM, RAM and NVMe temperatures, power, fans) and energy cost.
+  ![The Grafana dashboard's pool row: workers up, tokens per second, prompt cache hit rate, gateway requests, slots and routing decisions](docs/img/grafana-pool.png)
+
 - **Alerts** for heat, stalled fans, low disk and workers going down, pushed to your phone
   through a self-hosted [ntfy](https://ntfy.sh). On Windows, run LibreHardwareMonitor with its
   web server on and set `host_metrics` in `gateway.json`; the gateway relays those sensors
