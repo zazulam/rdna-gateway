@@ -163,22 +163,34 @@ func (p *Prom) Range(ctx context.Context, query string, over time.Duration, poin
 // MetricInfo is a metric name with its type and help text, if known.
 type MetricInfo struct{ Name, Type, Help string }
 
-// Names lists metric names containing every word of filter (case-insensitive).
-func (p *Prom) Names(ctx context.Context, filter string) ([]MetricInfo, error) {
+// catalog returns every metric name with its type and help text, if known.
+func (p *Prom) catalog(ctx context.Context) ([]MetricInfo, error) {
 	var names []string
 	if err := p.get(ctx, "/api/v1/label/__name__/values", url.Values{}, &names); err != nil {
 		return nil, err
 	}
 	var meta map[string][]struct{ Type, Help string }
 	_ = p.get(ctx, "/api/v1/metadata", url.Values{}, &meta) // best effort; recording rules have none
+	out := make([]MetricInfo, len(names))
+	for i, n := range names {
+		out[i] = MetricInfo{Name: n}
+		if md := meta[n]; len(md) > 0 {
+			out[i].Type, out[i].Help = md[0].Type, md[0].Help
+		}
+	}
+	return out, nil
+}
+
+// Names lists metric names containing every word of filter (case-insensitive).
+func (p *Prom) Names(ctx context.Context, filter string) ([]MetricInfo, error) {
+	all, err := p.catalog(ctx)
+	if err != nil {
+		return nil, err
+	}
 	words := strings.Fields(strings.ToLower(filter))
 	var out []MetricInfo
-	for _, n := range names {
-		m := MetricInfo{Name: n}
-		if md := meta[n]; len(md) > 0 {
-			m.Type, m.Help = md[0].Type, md[0].Help
-		}
-		hay := strings.ToLower(n + " " + m.Help)
+	for _, m := range all {
+		hay := strings.ToLower(m.Name + " " + m.Help)
 		ok := true
 		for _, w := range words {
 			ok = ok && strings.Contains(hay, w)
@@ -188,6 +200,162 @@ func (p *Prom) Names(ctx context.Context, filter string) ([]MetricInfo, error) {
 		}
 	}
 	return out, nil
+}
+
+// Nearest ranks existing metrics by how well their names and help text match
+// the words in text, which may be a PromQL expression (its functions, keywords,
+// label names and string literals are ignored) or plain words. It returns at
+// most k metrics with a nonzero score, best first, and the identifiers in text
+// that are exact metric names (a query on an existing metric that returns
+// nothing has a label filter or range problem, not a name problem).
+func (p *Prom) Nearest(ctx context.Context, text string, k int) (near []MetricInfo, exact []string, err error) {
+	all, err := p.catalog(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	words, idents := queryWords(text)
+	known := map[string]bool{}
+	for _, m := range all {
+		known[m.Name] = true
+	}
+	for _, id := range idents {
+		if known[id] {
+			exact = append(exact, id)
+		}
+	}
+	if len(words) == 0 {
+		return nil, exact, nil
+	}
+	type scored struct {
+		m MetricInfo
+		s int
+	}
+	var ss []scored
+	for _, m := range all {
+		name := strings.ToLower(m.Name)
+		parts := map[string]bool{}
+		for _, w := range splitWords(name) {
+			parts[stem(w)] = true
+		}
+		help := strings.ToLower(m.Help)
+		// Each query word scores its best match: 3 for a whole name part, 2 for
+		// part of the name, 1 for the help text; a synonym's match scores one less.
+		s := 0
+		for w, syns := range words {
+			best := 0
+			for i, x := range append([]string{w}, syns...) {
+				v := 0
+				switch {
+				case parts[x]:
+					v = 3
+				case len(x) >= 3 && strings.Contains(name, x):
+					v = 2
+				case len(x) >= 3 && strings.Contains(help, x):
+					v = 1
+				}
+				if i > 0 && v > 0 {
+					v--
+				}
+				best = max(best, v)
+			}
+			s += best
+		}
+		if s > 0 {
+			ss = append(ss, scored{m, s})
+		}
+	}
+	sort.Slice(ss, func(i, j int) bool {
+		if ss[i].s != ss[j].s {
+			return ss[i].s > ss[j].s
+		}
+		if len(ss[i].m.Name) != len(ss[j].m.Name) {
+			return len(ss[i].m.Name) < len(ss[j].m.Name)
+		}
+		return ss[i].m.Name < ss[j].m.Name
+	})
+	for i := 0; i < len(ss) && i < k; i++ {
+		near = append(near, ss[i].m)
+	}
+	return near, exact, nil
+}
+
+var (
+	promString = regexp.MustCompile(`"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|` + "`[^`]*`")
+	promLabels = regexp.MustCompile(`\b(?:by|without|on|ignoring|group_left|group_right)\s*\([^)]*\)`)
+	promIdent  = regexp.MustCompile(`[A-Za-z_:][A-Za-z0-9_:]*`)
+	promLabel  = regexp.MustCompile(`\{[^}]*\}`)
+	promRange  = regexp.MustCompile(`\[[^\]]*\]`)
+)
+
+// promWords are PromQL functions, aggregations and keywords: never metric words.
+var promWords = map[string]bool{}
+
+func init() {
+	for _, w := range strings.Fields(`sum avg min max count count_values stddev stdvar topk bottomk quantile group limitk
+		limit_ratio by without on ignoring group_left group_right bool and or unless offset atan2
+		abs absent absent_over_time ceil changes clamp clamp_max clamp_min day_of_month day_of_week day_of_year
+		days_in_month delta deriv exp floor histogram_quantile histogram_avg histogram_count histogram_sum
+		histogram_fraction holt_winters double_exponential_smoothing hour idelta increase irate label_join
+		label_replace ln log2 log10 minute month predict_linear rate resets round scalar sgn sort sort_desc
+		sort_by_label sort_by_label_desc sqrt time timestamp vector year avg_over_time min_over_time
+		max_over_time sum_over_time count_over_time quantile_over_time stddev_over_time stdvar_over_time
+		last_over_time present_over_time mad_over_time inf nan`) {
+		promWords[w] = true
+	}
+}
+
+// synonyms widen everyday words to the words lab metrics actually use.
+var synonyms = map[string][]string{
+	"house": {"consumption"}, "home": {"consumption"}, "load": {"consumption"}, "usage": {"consumption"},
+	"use": {"consumption"}, "consumed": {"consumption"}, "solar": {"production"}, "pv": {"production", "solar"},
+	"generation": {"production"}, "generated": {"production"}, "import": {"grid"}, "export": {"grid"},
+	"power": {"watt"}, "watt": {"power"}, "draw": {"watt", "power"}, "temp": {"temperature", "celsius"},
+	"temperature": {"temp", "celsius"}, "price": {"cost"}, "cost": {"usd"}, "online": {"up"}, "alive": {"up"},
+	"down": {"up"}, "status": {"up"}, "tps": {"token", "second"},
+}
+
+// stopWords carry no meaning in a metric name on their own.
+var stopWords = map[string]bool{"the": true, "now": true, "current": true, "of": true, "per": true}
+
+// queryWords extracts lowercased, stemmed words (each with its synonyms) from a
+// PromQL expression or plain text, and the raw identifiers that could be metric names.
+func queryWords(text string) (map[string][]string, []string) {
+	t := promString.ReplaceAllString(text, " ")
+	t = promLabels.ReplaceAllString(t, " ")
+	t = promLabel.ReplaceAllString(t, " ")
+	t = promRange.ReplaceAllString(t, " ")
+	words := map[string][]string{}
+	var idents []string
+	for _, id := range promIdent.FindAllString(t, -1) {
+		if promWords[strings.ToLower(id)] {
+			continue
+		}
+		idents = append(idents, id)
+		for _, raw := range splitWords(strings.ToLower(id)) {
+			w := stem(raw)
+			if stopWords[w] || len(w) < 2 {
+				continue
+			}
+			if syn := synonyms[raw]; syn != nil {
+				words[w] = syn
+			} else {
+				words[w] = synonyms[w]
+			}
+		}
+	}
+	return words, idents
+}
+
+func splitWords(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool { return r == '_' || r == ':' || r == '-' || r == '.' })
+}
+
+// stem drops a plural "s" so "workers" matches "worker" and "watts" matches "watt".
+func stem(w string) string {
+	if len(w) > 3 && strings.HasSuffix(w, "s") && !strings.HasSuffix(w, "ss") {
+		return w[:len(w)-1]
+	}
+	return w
 }
 
 // LabelString renders labels as {a="b", c="d"}, sorted, without __name__ first.

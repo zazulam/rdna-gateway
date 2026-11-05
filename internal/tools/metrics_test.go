@@ -91,3 +91,49 @@ func TestParseWindow(t *testing.T) {
 		}
 	}
 }
+
+func TestNearestRanksRealNamesForGuesses(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/label/__name__/values":
+			w.Write([]byte(`{"status":"success","data":["envoy_consumption_watts","envoy_grid_watts",
+				"envoy_production_watts","envoy_up","lab:power_watts","lab:power_watts:sum","lab:solar_watts",
+				"node_cpu_seconds_total","rdnagw_worker_up","rdnagw_worker_inflight","up"]}`))
+		case "/api/v1/metadata":
+			w.Write([]byte(`{"status":"success","data":{
+				"envoy_consumption_watts":[{"type":"gauge","help":"House consumption now"}],
+				"rdnagw_worker_up":[{"type":"gauge","help":"1 if the worker's last health check passed"}]}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	p, ctx := NewProm(srv.URL), context.Background()
+	for _, c := range []struct{ query, want string }{
+		{`sum(house_power_watts)`, "envoy_consumption_watts"},
+		{`solar_production_watts{box="desktop"}`, "envoy_production_watts"},
+		{`grid_power`, "envoy_grid_watts"},
+		{`count(workers_up == 1)`, "rdnagw_worker_up"},
+		{`avg_over_time(lab_solar_watts[5m])`, "lab:solar_watts"},
+	} {
+		near, exact, err := p.Nearest(ctx, c.query, 3)
+		if err != nil || len(exact) != 0 {
+			t.Fatalf("%s: %v exact=%v", c.query, err, exact)
+		}
+		var names []string
+		for _, m := range near {
+			names = append(names, m.Name)
+		}
+		if !strings.Contains(strings.Join(names, " "), c.want) {
+			t.Errorf("%s: want %s in top 3, got %v", c.query, c.want, names)
+		}
+	}
+	// Functions, label names and string values are not metric words.
+	if near, _, _ := p.Nearest(ctx, `sum by (instance) (rate(x{job="node"}[5m]))`, 8); len(near) != 0 {
+		t.Errorf("keywords matched metrics: %+v", near)
+	}
+	// A query on an existing metric reports it as exact.
+	if _, exact, _ := p.Nearest(ctx, `envoy_grid_watts{phase="b"}`, 8); len(exact) != 1 || exact[0] != "envoy_grid_watts" {
+		t.Errorf("exact: %v", exact)
+	}
+}

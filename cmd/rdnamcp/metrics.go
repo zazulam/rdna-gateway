@@ -21,10 +21,10 @@ func metricsTools(p *tools.Prom, dashboards string) []mcp.Tool {
 	ts := []mcp.Tool{
 		{
 			Name: "metrics_query",
-			Description: "Run a PromQL query against the lab's Prometheus and return the current value of each series. " +
-				"Read-only. Use lab_dashboard to find the queries the Grafana dashboard uses (cost, power, solar, " +
-				"temperatures, tokens/s), or metrics_names to find metrics.",
-			Schema: schema(map[string]any{"query": str("PromQL expression, e.g. lab:power_watts:sum")}, "query"),
+			Description: startHint +
+				"Runs a PromQL query against the lab's Prometheus and returns the current value of each series. " +
+				"Read-only. If nothing matches, the reply lists the closest existing metric names.",
+			Schema: schema(map[string]any{"query": str("PromQL expression, e.g. lab:power_watts:sum, envoy_grid_watts or rdnagw_worker_up")}, "query"),
 			Call: func(ctx context.Context, a json.RawMessage) (string, error) {
 				var q struct{ Query string }
 				json.Unmarshal(a, &q)
@@ -35,13 +35,18 @@ func metricsTools(p *tools.Prom, dashboards string) []mcp.Tool {
 				if err != nil {
 					return "", err
 				}
+				if len(ss) == 0 {
+					return noData(ctx, p, q.Query, "No data (empty result)."), nil
+				}
 				return formatInstant(ss), nil
 			},
 		},
 		{
 			Name: "metrics_range",
-			Description: "Run a PromQL query over a recent window (e.g. 6h, 7d) and summarize each series: " +
-				"min, mean, max, last, plus a short downsampled series. Read-only.",
+			Description: startHint +
+				"Runs a PromQL query over a recent window (e.g. 6h, 7d) and summarizes each series: " +
+				"min, mean, max, last, plus a short downsampled series. Read-only. If nothing matches, the reply " +
+				"lists the closest existing metric names.",
 			Schema: schema(map[string]any{"query": str("PromQL expression"),
 				"window": str("lookback: number + m/h/d/w, default 6h, max 30d"),
 				"points": num("samples in the summary series, 2-48, default 12")}, "query"),
@@ -69,13 +74,17 @@ func metricsTools(p *tools.Prom, dashboards string) []mcp.Tool {
 				if err != nil {
 					return "", err
 				}
+				if len(ss) == 0 {
+					return noData(ctx, p, q.Query, "No data in the last "+q.Window+"."), nil
+				}
 				return formatRange(ss, q.Window, step, clamp(q.Points, 2, 48, 12)), nil
 			},
 		},
 		{
-			Name:        "metrics_names",
-			Description: "Find lab metric names (and their help text) containing all the given words, e.g. \"gpu temp\" or \"envoy\".",
-			Schema:      schema(map[string]any{"filter": str("words to match; empty lists everything")}),
+			Name: "metrics_names",
+			Description: "Find lab metric names (and their help text) containing all the given words, e.g. \"gpu temp\" " +
+				"or \"envoy\". If no name contains every word, returns the closest matches instead.",
+			Schema: schema(map[string]any{"filter": str("words to match; empty lists everything")}),
 			Call: func(ctx context.Context, a json.RawMessage) (string, error) {
 				var q struct{ Filter string }
 				json.Unmarshal(a, &q)
@@ -84,7 +93,11 @@ func metricsTools(p *tools.Prom, dashboards string) []mcp.Tool {
 					return "", err
 				}
 				if len(ms) == 0 {
-					return "No matching metrics.", nil
+					near, _, err := p.Nearest(ctx, q.Filter, nearestNames)
+					if err != nil || len(near) == 0 {
+						return "No matching metrics. " + dashboardHint, nil
+					}
+					return "No metric contains every word; closest matches:\n" + listMetrics(near) + "\n\n" + dashboardHint, nil
 				}
 				var b strings.Builder
 				for i, m := range ms {
@@ -110,8 +123,10 @@ func metricsTools(p *tools.Prom, dashboards string) []mcp.Tool {
 	}
 	return append(ts, mcp.Tool{
 		Name: "lab_dashboard",
-		Description: "List the Grafana dashboard's panels (section, title, unit) with the PromQL behind each, so you can " +
-			"answer with the same numbers the dashboard shows. Pass run=true to also evaluate each listed panel now.",
+		Description: startHint +
+			"Lists the Grafana dashboard's panels (section, title, unit) with the PromQL behind each, so you can " +
+			"answer with the same numbers the dashboard shows; run=true also evaluates each listed panel now. " +
+			"Topics include power, cost, solar, grid, workers, temperatures and tokens/s.",
 		Schema: schema(map[string]any{"filter": str("words to match in section or title, e.g. \"cost\", \"solar\", \"temperature\""),
 			"run": map[string]any{"type": "boolean", "description": "evaluate the matching panels' queries now (at most 12 panels)"}}),
 		Call: func(ctx context.Context, a json.RawMessage) (string, error) {
@@ -161,7 +176,15 @@ func metricsTools(p *tools.Prom, dashboards string) []mcp.Tool {
 				b.WriteByte('\n')
 			}
 			if n == 0 {
-				return "No panels match; try a broader filter or none.", nil
+				var secs []string
+				seen := map[string]bool{}
+				for _, pn := range panels {
+					if !seen[pn.Section] {
+						seen[pn.Section] = true
+						secs = append(secs, pn.Section)
+					}
+				}
+				return "No panels match; try one word or none. Sections: " + strings.Join(secs, ", ") + ".", nil
 			}
 			out := strings.TrimSpace(b.String())
 			if q.Run && n > 12 {
@@ -171,6 +194,50 @@ func metricsTools(p *tools.Prom, dashboards string) []mcp.Tool {
 			return out, nil
 		},
 	})
+}
+
+const (
+	startHint = "Start with lab_dashboard (run=true, filter=<topic>) for current lab values; " +
+		"use metrics_names to find exact series before querying. "
+	dashboardHint = "For current lab values (power, solar, grid, workers, temperatures, cost) call lab_dashboard " +
+		"with run=true and a filter such as \"solar\"; use metrics_names to search metric names."
+	nearestNames = 8
+)
+
+// noData explains an empty result: whether the query's metric exists at all,
+// the closest existing metric names, and where current values come from.
+// A small model that guessed a name otherwise reads "no data" as an answer.
+func noData(ctx context.Context, p *tools.Prom, query, msg string) string {
+	near, exact, err := p.Nearest(ctx, query, nearestNames)
+	var b strings.Builder
+	b.WriteString(msg)
+	if err == nil {
+		if len(exact) > 0 {
+			fmt.Fprintf(&b, " %s exists, so the label filters or the window match nothing.", strings.Join(exact, ", "))
+		} else {
+			b.WriteString(" No metric in the query exists in Prometheus; the name is probably wrong.")
+		}
+		if len(near) > 0 {
+			b.WriteString("\n\nClosest existing metrics:\n" + listMetrics(near))
+		}
+	}
+	b.WriteString("\n\n" + dashboardHint)
+	return b.String()
+}
+
+func listMetrics(ms []tools.MetricInfo) string {
+	var b strings.Builder
+	for _, m := range ms {
+		b.WriteString("- " + m.Name)
+		if m.Type != "" {
+			fmt.Fprintf(&b, " (%s)", m.Type)
+		}
+		if m.Help != "" {
+			fmt.Fprintf(&b, ": %s", m.Help)
+		}
+		b.WriteByte('\n')
+	}
+	return strings.TrimRight(b.String(), "\n")
 }
 
 func formatInstant(ss []tools.Series) string {
