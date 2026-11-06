@@ -324,12 +324,14 @@ groups:
           - refId: C
             datasourceUid: __expr__
             model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: lt, params: [10]}}]}
+      # One alert instance per worker / target (not a count), so the push says
+      # which one is down and each resolves on its own.
       - <<: *rule
         uid: worker-down
         title: Inference worker down
         for: 5m
         annotations:
-          summary: A gateway worker has failed health checks for 5 minutes (the desktop being off or asleep also triggers this).
+          summary: "Worker {{ .Labels.worker }} has failed the gateway's health checks for 5 minutes. Check its supervisor log; a powered-off or asleep box also triggers this."
         data:
           - refId: A
             relativeTimeRange: {from: 600, to: 0}
@@ -337,16 +339,34 @@ groups:
             model:
               refId: A
               instant: true
-              expr: count(rdnagw_worker_up == 0)
+              expr: rdnagw_worker_up
           - refId: C
             datasourceUid: __expr__
-            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [0]}}]}
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: lt, params: [1]}}]}
+      - <<: *rule
+        uid: gateway-down
+        title: Gateway down
+        for: 3m
+        labels: {severity: critical}
+        annotations:
+          summary: "Prometheus can't reach the gateway at {{ .Labels.instance }}: no requests are being routed, and the workers it relays (and its host's sensors) go dark with it. The gateway box may be off or asleep, or rdnagw stopped."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: up{job="gateway"}
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: lt, params: [1]}}]}
       - <<: *rule
         uid: scrape-down
         title: Monitoring target down
         for: 5m
         annotations:
-          summary: Prometheus can't reach one of its targets (gateway, a worker, the MCP server, Qdrant or node_exporter).
+          summary: "Prometheus can't scrape {{ .Labels.job }} ({{ .Labels.instance }}) for 5 minutes."
         data:
           - refId: A
             relativeTimeRange: {from: 600, to: 0}
@@ -354,7 +374,7 @@ groups:
             model:
               refId: A
               instant: true
-              expr: count(up == 0)
+              expr: up
           - refId: C
             datasourceUid: __expr__
-            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [0]}}]}
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: lt, params: [1]}}]}
