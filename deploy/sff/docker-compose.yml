@@ -52,8 +52,11 @@ services:
       - --path.rootfs=/host
       - --web.listen-address=127.0.0.1:9101 # :9100 is taken by k3s's Traefik
       - --collector.drm # amdgpu busy %, VRAM
+      # hw_* power/GPU metrics from hw-metrics.service (workers/linux/install.sh metrics).
+      - --collector.textfile.directory=/textfile
     volumes:
       - /:/host:ro,rslave
+      - ${TEXTFILE_DIR:-${HOME}/.node-textfile}:/textfile:ro
 
   # A small MoE model on the CPU for quick jobs (titles, classification), so they
   # don't take a GPU slot. Add it to the gateway as another worker.

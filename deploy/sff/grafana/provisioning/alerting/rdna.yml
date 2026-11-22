@@ -301,6 +301,24 @@ groups:
           - refId: C
             datasourceUid: __expr__
             model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: lt, params: [1]}}]}
+      - <<: *rule
+        uid: hw-metrics-stale
+        title: Host power metrics stopped
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: A host that published hw_power_watts in the last day is up but no longer does. On Linux check hw-metrics.service and node_exporter's textfile directory; on Windows, LibreHardwareMonitor.
+        data:
+          - refId: A
+            relativeTimeRange: {from: 600, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: 'count((max_over_time(hw_power_watts[1d]) unless on (host, device, kind) hw_power_watts) and on (host) (max by (host) (up) == 1)) or vector(0)'
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [0]}}]}
 
   - orgId: 1
     name: availability

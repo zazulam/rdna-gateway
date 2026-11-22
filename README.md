@@ -86,6 +86,7 @@ The numbers are from this repo's own harness ([docs/BENCHMARKS.md](docs/BENCHMAR
 | **Gateway** (`rdnagw`) | One OpenAI-compatible endpoint: routing, failover, retries, streaming, `/metrics` | `cmd/rdnagw`, `internal/gateway` |
 | **Agent tools** (`rdnamcp`) | MCP server: web search, page fetch, document search, memory, lab metrics | `cmd/rdnamcp`, `internal/{mcp,rag,tools}` |
 | **Monitoring stack** | Docker Compose: Prometheus, Grafana dashboard, alerts to your phone, Qdrant, SearXNG | `deploy/sff` |
+| **Hardware metrics** | GPU and host power, GPU load, VRAM and temperatures as the same `hw_*` series on every host | `cmd/hwmetrics`, `internal/hw` |
 | **Energy exporter** | Reads an Enphase solar gateway for the power, cost and solar panels | `cmd/envoyexporter` |
 | **Benchmarks** | Agent-shaped load generator, retrieval bench, scripts that run whole test matrices | `cmd/rdnabench`, `cmd/ragbench`, `bench/` |
 | **Docs** | Results, architecture diagrams, slide decks (Marp sources included) | `docs/` |
@@ -210,6 +211,10 @@ The `deploy/sff` stack adds, on one Linux box:
   through a self-hosted [ntfy](https://ntfy.sh). On Windows, run LibreHardwareMonitor with its
   web server on and set `host_metrics` in `gateway.json`; the gateway relays those sensors
   at `/metrics/host` in a form Prometheus accepts.
+- **Hardware metrics:** every host's GPU power, load, VRAM and temperatures (and board power
+  on a Jetson) as the same OpenTelemetry-named `hw_*` series: translated by the gateway on
+  Windows, written by `hwmetrics` for node_exporter on Linux. See
+  [docs/HARDWARE-METRICS.md](docs/HARDWARE-METRICS.md), including the idle baselines.
 - **Energy and solar (optional):** power per box (measured where the hardware reports it,
   estimated otherwise), cost at your electricity rate, and with an Enphase gateway, how much
   of the lab's energy your panels covered. Set the rates and `ENVOY_URL` in `.env`.

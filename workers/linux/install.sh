@@ -5,6 +5,7 @@
 #   MODEL=/path/model.gguf ALIAS=gemma4:12b ./install.sh service
 #   ./install.sh ollama-blob gemma4:12b-it-qat   # print the GGUF path of an Ollama model
 #   NAME=embed MODEL=... ALIAS=... PORT=8083 HOST=100.x.y.z ARGS="--embedding --pooling last" ./install.sh aux
+#   ./install.sh metrics                 # hw-metrics.service: GPU power etc. for node_exporter
 #
 # Runs llama-server under a systemd user unit (llama-worker.service). "aux"
 # adds a small model next to it on the same GPU (llama-NAME.service), e.g. an
@@ -109,10 +110,38 @@ EOF
   return 1
 }
 
+# hwmetrics writes GPU power, utilization, VRAM and temperatures in the shared
+# hw_* form to node_exporter's textfile directory. Build it with
+#   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o hwmetrics ./cmd/hwmetrics   (arm64 on a Jetson)
+# and copy it to ~/bin first.
+install_metrics() {
+  local bin="${HWMETRICS:-$HOME/bin/hwmetrics}" dir="${TEXTFILE_DIR:-$HOME/.node-textfile}"
+  [[ -x "$bin" ]] || { echo "$bin missing: build cmd/hwmetrics and copy it there" >&2; return 1; }
+  mkdir -p "$HOME/.config/systemd/user" "$dir"
+  cat >"$HOME/.config/systemd/user/hw-metrics.service" <<EOF
+[Unit]
+Description=Hardware metrics for node_exporter's textfile collector (rdna-gateway)
+
+[Service]
+ExecStart=$bin -textfile $dir/hw.prom -interval 15s
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable hw-metrics.service
+  systemctl --user restart hw-metrics.service
+  loginctl enable-linger "$USER" 2>/dev/null || true
+  "$bin" -once -textfile - | grep '^hw_' || echo "no hw_* readings: is this an amdgpu box?" >&2
+}
+
 case "${1:-build}" in
   build) install_build ;;
   service) install_service ;;
   aux) install_aux ;;
+  metrics) install_metrics ;;
   ollama-blob) ollama_blob "$2" ;;
-  *) echo "usage: $0 [build|service|aux|ollama-blob NAME]" >&2; exit 2 ;;
+  *) echo "usage: $0 [build|service|aux|metrics|ollama-blob NAME]" >&2; exit 2 ;;
 esac

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Retrieval node on a Jetson (Orin Nano Super, JetPack 6.2): llama.cpp built for
 # CUDA sm_87, the embedder and reranker as systemd user units, and node_exporter
-# plus a temperature script for monitoring.
+# plus a temperature script and hwmetrics (board power, GPU load) for monitoring.
 #
 #   HOST=100.x.y.z ./setup.sh build      # llama.cpp b11723 with CUDA (~20 min)
 #   HOST=100.x.y.z ./setup.sh services   # embed :8083, rerank :8084, node_exporter :9100
@@ -46,10 +46,20 @@ services)
   # jetson-sensors.sh writes the readable ones for the textfile collector.
   install -m 755 jetson-sensors.sh "$HOME/bin/jetson-sensors.sh"
   unit jetson-sensors "Jetson sensors for node_exporter" "$HOME/bin/jetson-sensors.sh"
+  # hwmetrics (cmd/hwmetrics built for linux/arm64) adds the INA3221 board power
+  # and GPU load in the hw_* form the other hosts use.
+  units="llama-embed llama-rerank jetson-sensors node-exporter"
+  if [[ -x $HOME/bin/hwmetrics ]]; then
+    unit hw-metrics "Hardware metrics for node_exporter" "$HOME/bin/hwmetrics -textfile $HOME/.node-textfile/hw.prom -interval 15s"
+    units="$units hw-metrics"
+  else
+    echo "optional: build cmd/hwmetrics for linux/arm64 into ~/bin for hw_* power metrics" >&2
+  fi
   [[ -x $HOME/bin/node_exporter ]] || echo "install the linux-arm64 node_exporter to ~/bin first" >&2
   unit node-exporter "Prometheus node_exporter" "$HOME/bin/node_exporter --web.listen-address=$HOST:9100 --no-collector.thermal_zone --collector.textfile.directory=$HOME/.node-textfile"
   systemctl --user daemon-reload
-  systemctl --user enable --now llama-embed llama-rerank jetson-sensors node-exporter
+  # shellcheck disable=SC2086
+  systemctl --user enable --now $units
   loginctl enable-linger "$USER" || true ;;
 *) sed -n '2,10p' "$0"; exit 2 ;;
 esac
