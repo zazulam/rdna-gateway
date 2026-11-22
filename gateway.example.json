@@ -4,6 +4,7 @@
   "block_chars": 512,
   "health_interval": "5s",
   "host_metrics": "http://127.0.0.1:8085/metrics",
+  "otlp": { "endpoint": "http://100.64.0.20:4318", "service_name": "rdnagw" },
   "workers": [
     { "name": "desktop-6900xt", "url": "http://100.64.0.10:8081", "slots": 4 },
     { "name": "server-6700xt", "url": "http://100.64.0.20:8081", "slots": 1 },

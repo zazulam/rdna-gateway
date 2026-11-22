@@ -196,6 +196,43 @@ Each response says where it went, in `X-Gateway-Worker`, `X-Gateway-Route` and
 The gateway also retries dropped keep-alive connections, aborts stalled streams, and
 exposes Prometheus metrics at `/metrics`.
 
+### Tracing
+
+Set an OTLP endpoint and the gateway sends one OpenTelemetry span per proxied request,
+following the [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/),
+so each inference call shows up inside the agent run that made it. It speaks OTLP/HTTP with
+JSON bodies, which any OTLP/HTTP receiver accepts (port 4318 on a collector), and needs no
+extra dependencies. With no endpoint it stays off.
+
+```json
+"otlp": { "endpoint": "http://100.64.0.20:4318", "service_name": "rdnagw" }
+```
+
+The standard variables override the file: `OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`,
+`OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, and
+`OTEL_SDK_DISABLED=true` turns it off. Only `http/json` is spoken.
+
+| Span attribute | From |
+|---|---|
+| `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.request.max_tokens` / `temperature` / `top_p` / `seed` | the request |
+| `gen_ai.response.model`, `gen_ai.response.id`, `gen_ai.response.finish_reasons` | the worker's response |
+| `gen_ai.usage.input_tokens`, `output_tokens`, `cache_read.input_tokens` | the usage block and llama-server's `timings` |
+| `gen_ai.server.time_to_first_token` | streams: request accepted → first chunk carrying text, reasoning or a tool call |
+| `server.address` | the worker's name from `gateway.json` |
+| `rdnagw.route`, `rdnagw.matched_blocks`, `rdnagw.retries`, `rdnagw.outcome` | the routing decision; outcome is `ok`, `error`, `stalled` or `client_gone` |
+| `error.type` | the status code, `stalled`, `client_gone`, `no_worker` or `stream_error` |
+
+Each retry is a `rdnagw.retry` span event (the failed worker and why) and a stalled stream
+adds a `rdnagw.stall` event. Spans never carry prompts, completions, tool arguments or tool
+results: only names, ids, counts and timings. They are batched in the background; if the
+collector is slow or down, spans are dropped rather than slowing requests.
+
+Trace context flows through: a caller's `traceparent` becomes the span's parent, `traceparent`
+(now the gateway's span), `tracestate` and `baggage` go on to the worker, and the response
+carries the span's `traceparent` next to `X-Gateway-Worker`. With tracing off, the caller's
+headers pass to the worker unchanged.
+
 ## Agent services
 
 The `deploy/sff` stack adds, on one Linux box:

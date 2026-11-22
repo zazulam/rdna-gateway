@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/zazulam/rdna-gateway/internal/otlp"
 )
 
 // Config is the gateway's JSON config file.
@@ -33,8 +35,12 @@ type Config struct {
 	// HostMetrics is a local exporter to relay at /metrics/host, e.g.
 	// LibreHardwareMonitor's "http://127.0.0.1:8085/metrics" for GPU temperatures
 	// on Windows. Its output is regrouped into valid Prometheus text.
-	HostMetrics string         `json:"host_metrics,omitempty"`
-	Workers     []WorkerConfig `json:"workers"`
+	HostMetrics string `json:"host_metrics,omitempty"`
+	// OTLP exports a span per proxied request to an OpenTelemetry collector
+	// (OTLP/HTTP JSON). The standard OTEL_EXPORTER_OTLP_* and OTEL_SERVICE_NAME
+	// environment variables override it; with no endpoint, export is off.
+	OTLP    otlp.Config    `json:"otlp,omitempty"`
+	Workers []WorkerConfig `json:"workers"`
 }
 
 // WorkerConfig describes one llama-server (or any OpenAI-compatible) backend.
