@@ -292,6 +292,16 @@ The `deploy/sff` stack adds, on one Linux box:
   Index a folder from any machine:
   `rdnamcp index -url http://<box>:8090/mcp -collection docs <paths>`.
 
+  `rdnamcp` exposes `mcp_server_tool_calls_total{tool,outcome}` and the histogram
+  `mcp_server_operation_duration_seconds{tool}` at `/metrics`. Set
+  `OTEL_EXPORTER_OTLP_ENDPOINT` (and the other standard `OTEL_*` variables) to also send
+  OpenTelemetry traces to any OTLP/HTTP receiver: a span per MCP request following the
+  [MCP semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/),
+  parented by the caller's `traceparent` (from `params._meta` or the HTTP header) so it nests
+  under the agent's tool call, with child spans for embedding, reranking and Qdrant. Spans,
+  metrics and logs hold tool names, ids, counts, timings and error classes, never tool
+  arguments, results, queries, fetched pages or memories.
+
 The embedder and reranker are small llama.cpp servers. Run them next to the GPU worker:
 
 ```sh
