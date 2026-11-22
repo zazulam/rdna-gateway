@@ -128,12 +128,12 @@ panel("timeseries", "Prompt cache hit by worker",
 y += 8
 
 row("Agent tools (MCP, retrieval, search)")
-panel("timeseries", "Tool calls", [(f"sum by (tool) (rate(rdnamcp_tool_calls_total[{R}]))", "{{tool}}")],
+panel("timeseries", "Tool calls", [(f"sum by (tool) (rate(mcp_server_tool_calls_total[{R}]))", "{{tool}}")],
       0, 8, 7, unit="reqps", stack=True)
-panel("timeseries", "Tool latency (mean)",
-      [(f'sum by (tool) (rate(rdnamcp_tool_seconds_total[{R}])) / sum by (tool) (rate(rdnamcp_tool_calls_total[{R}]))', "{{tool}}")],
+panel("timeseries", "Tool latency (p95)",
+      [(f'histogram_quantile(0.95, sum by (tool, le) (rate(mcp_server_operation_duration_seconds_bucket[{R}])))', "{{tool}}")],
       8, 8, 7, unit="s", desc="search_docs includes embedding the query and reranking the candidates on the CPU.")
-panel("stat", "Tool errors (24h)", [('sum by (tool) (increase(rdnamcp_tool_calls_total{result="error"}[24h]))', "{{tool}}")],
+panel("stat", "Tool errors (24h)", [('sum by (tool) (increase(mcp_server_tool_calls_total{outcome="error"}[24h]))', "{{tool}}")],
       16, 4, 7, decimals=0, thresholds=[{"color": "green", "value": None}, {"color": "orange", "value": 1}],
       desc="fetch_url errors include refused private addresses and dead links.")
 panel("stat", "Indexed passages", [("sum by (id) (collection_points)", "{{id}}")], 20, 4, 7, decimals=0,

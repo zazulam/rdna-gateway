@@ -6,14 +6,16 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net/http"
-	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/zazulam/rdna-gateway/internal/tracing"
 )
 
 // Tool is one callable tool. Call returns the text shown to the model; an
@@ -26,54 +28,19 @@ type Tool struct {
 }
 
 // Server dispatches JSON-RPC requests to its tools. Token, if set, is required
-// as a bearer token.
+// as a bearer token. Tracer, if set, gets a server span per request following
+// the OpenTelemetry MCP semantic conventions; spans and metrics carry names,
+// ids, outcomes and timings, never tool arguments or results.
 type Server struct {
 	Name, Version string
 	Token         string
 	Tools         []Tool
 	Logf          func(string, ...any)
+	Tracer        tracing.Tracer
 
-	mu    sync.Mutex
-	stats map[[2]string]*callStats // by (tool, "ok"|"error")
-}
-
-type callStats struct {
-	n       int64
-	seconds float64
-}
-
-func (s *Server) record(tool string, ok bool, d time.Duration) {
-	res := "ok"
-	if !ok {
-		res = "error"
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.stats == nil {
-		s.stats = map[[2]string]*callStats{}
-	}
-	k := [2]string{tool, res}
-	if s.stats[k] == nil {
-		s.stats[k] = &callStats{}
-	}
-	s.stats[k].n++
-	s.stats[k].seconds += d.Seconds()
-}
-
-// Metrics writes per-tool call counts and time in the Prometheus text format.
-func (s *Server) Metrics(rw http.ResponseWriter, _ *http.Request) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	keys := make([][2]string, 0, len(s.stats))
-	for k := range s.stats {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool { return keys[i][0]+keys[i][1] < keys[j][0]+keys[j][1] })
-	rw.Header().Set("Content-Type", "text/plain; version=0.0.4")
-	for _, k := range keys {
-		fmt.Fprintf(rw, "rdnamcp_tool_calls_total{tool=%q,result=%q} %d\n", k[0], k[1], s.stats[k].n)
-		fmt.Fprintf(rw, "rdnamcp_tool_seconds_total{tool=%q,result=%q} %.3f\n", k[0], k[1], s.stats[k].seconds)
-	}
+	mu        sync.Mutex
+	calls     map[[2]string]uint64 // by (tool, "ok"|"error")
+	durations map[string]*histogram
 }
 
 type rpcRequest struct {
@@ -125,11 +92,110 @@ func (s *Server) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		rw.WriteHeader(http.StatusAccepted)
 		return
 	}
-	result, rerr := s.dispatch(req.Context(), r)
+	ctx, span := s.startSpan(req, r)
+	result, rerr := s.dispatch(ctx, span, r)
+	if rerr != nil {
+		span.SetError(strconv.Itoa(rerr.Code))
+	}
+	span.End()
 	writeRPC(rw, r.ID, result, rerr)
 }
 
-func (s *Server) dispatch(ctx context.Context, r rpcRequest) (any, *rpcError) {
+// startSpan opens the request's server span, parented by the caller's trace
+// context: params._meta.traceparent (MCP's own propagation) or else the
+// traceparent HTTP header.
+func (s *Server) startSpan(req *http.Request, r rpcRequest) (context.Context, tracing.Span) {
+	ctx := req.Context()
+	if s.Tracer == nil {
+		return ctx, tracing.Noop
+	}
+	ctx = tracing.WithTracer(ctx, s.Tracer)
+	var p struct {
+		Name string `json:"name"`
+		Meta struct {
+			Traceparent string `json:"traceparent"`
+		} `json:"_meta"`
+	}
+	json.Unmarshal(r.Params, &p)
+	parent := p.Meta.Traceparent
+	if parent == "" {
+		parent = req.Header.Get("traceparent")
+	}
+	method := methodName(r.Method)
+	name := method
+	attrs := []tracing.Attr{
+		tracing.String("mcp.method.name", method),
+		tracing.String("network.transport", "tcp"),
+		tracing.String("network.protocol.name", "http"),
+	}
+	if id := idValue(r.ID); id != "" {
+		attrs = append(attrs, tracing.String("jsonrpc.request.id", id))
+	}
+	if sid := token(req.Header.Get("Mcp-Session-Id")); sid != "" {
+		attrs = append(attrs, tracing.String("mcp.session.id", sid))
+	}
+	if v := token(req.Header.Get("Mcp-Protocol-Version")); v != "" {
+		attrs = append(attrs, tracing.String("mcp.protocol.version", v))
+	}
+	if r.Method == "tools/call" {
+		tool := s.toolLabel(p.Name)
+		name += " " + tool
+		attrs = append(attrs, tracing.String("gen_ai.tool.name", tool), tracing.String("gen_ai.operation.name", "execute_tool"))
+	}
+	return s.Tracer.Start(ctx, name, tracing.Server, parent, attrs...)
+}
+
+var knownMethods = map[string]bool{"initialize": true, "ping": true, "tools/list": true, "tools/call": true}
+
+// methodName keeps span names and attributes to methods MCP defines.
+func methodName(m string) string {
+	if knownMethods[m] || strings.HasPrefix(m, "notifications/") && len(m) < 64 {
+		return m
+	}
+	return "_OTHER"
+}
+
+// idValue is a JSON-RPC id as a string: a number, or a short string.
+func idValue(raw json.RawMessage) string {
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return ""
+	}
+	switch x := v.(type) {
+	case float64:
+		return strings.TrimSpace(string(raw))
+	case string:
+		return token(x)
+	}
+	return ""
+}
+
+// token returns s if it looks like an identifier (short, visible ASCII), else "".
+func token(s string) string {
+	if len(s) == 0 || len(s) > 128 {
+		return ""
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x21 || s[i] > 0x7e {
+			return ""
+		}
+	}
+	return s
+}
+
+// errorType is the OpenTelemetry error.type for a failed tool call: a class,
+// never the message, which can quote the query or URL.
+func errorType(err error) string {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	}
+	return "tool_error"
+}
+
+func (s *Server) dispatch(ctx context.Context, span tracing.Span, r rpcRequest) (any, *rpcError) {
 	switch r.Method {
 	case "initialize":
 		var p struct {
@@ -154,11 +220,13 @@ func (s *Server) dispatch(ctx context.Context, r rpcRequest) (any, *rpcError) {
 		}
 		return map[string]any{"tools": tools}, nil
 	case "tools/call":
+		start := time.Now()
 		var p struct {
 			Name      string          `json:"name"`
 			Arguments json.RawMessage `json:"arguments"`
 		}
 		if err := json.Unmarshal(r.Params, &p); err != nil {
+			s.record("unknown", "error", time.Since(start))
 			return nil, &rpcError{-32602, "invalid params: " + err.Error()}
 		}
 		for _, t := range s.Tools {
@@ -168,15 +236,20 @@ func (s *Server) dispatch(ctx context.Context, r rpcRequest) (any, *rpcError) {
 			if len(p.Arguments) == 0 {
 				p.Arguments = json.RawMessage("{}")
 			}
-			start := time.Now()
 			text, err := t.Call(ctx, p.Arguments)
-			s.record(t.Name, err == nil, time.Since(start))
-			s.logf("tool %s %s err=%v", t.Name, time.Since(start).Round(time.Millisecond), err)
+			d := time.Since(start)
 			if err != nil {
+				et := errorType(err)
+				span.SetError(et)
+				s.record(t.Name, "error", d)
+				s.logf("tool %s %s error.type=%s", t.Name, d.Round(time.Millisecond), et)
 				return toolResult(err.Error(), true), nil
 			}
+			s.record(t.Name, "ok", d)
+			s.logf("tool %s %s ok", t.Name, d.Round(time.Millisecond))
 			return toolResult(text, false), nil
 		}
+		s.record("unknown", "error", time.Since(start))
 		return nil, &rpcError{-32602, "unknown tool " + p.Name}
 	}
 	return nil, &rpcError{-32601, "method not found: " + r.Method}
