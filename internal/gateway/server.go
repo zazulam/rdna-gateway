@@ -15,6 +15,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -191,6 +193,8 @@ func (g *Gateway) get(ctx context.Context, url string, into any) error {
 }
 
 // ServeHTTP routes /v1/* to workers and serves /health and /metrics itself.
+// /metrics/host relays a local sensor exporter and /metrics/files serves
+// local Prometheus text files (Config.HostMetrics, Config.MetricsFiles).
 // /metrics/workers/<name> relays that worker's own llama-server /metrics, so a
 // scraper can reach workers that only listen on the gateway's host.
 func (g *Gateway) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -203,6 +207,9 @@ func (g *Gateway) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	case req.URL.Path == "/metrics/host":
 		g.serveHostMetrics(rw, req)
+		return
+	case req.URL.Path == "/metrics/files":
+		g.serveMetricsFiles(rw, req)
 		return
 	case strings.HasPrefix(req.URL.Path, "/metrics/workers/"):
 		g.serveWorkerMetrics(rw, req, strings.TrimPrefix(req.URL.Path, "/metrics/workers/"))
@@ -604,6 +611,35 @@ func (g *Gateway) serveHostMetrics(rw http.ResponseWriter, req *http.Request) {
 	// The same readings in the hw_* form Linux hosts write (internal/hw), so
 	// power and GPU queries don't depend on which OS a host runs.
 	hw.Render(rw, hw.FromLHM(body))
+}
+
+// serveMetricsFiles concatenates the configured text files (globs allowed),
+// regrouped so families split across files stay valid. A file being replaced
+// or missing is skipped; it shows up again on the next scrape.
+func (g *Gateway) serveMetricsFiles(rw http.ResponseWriter, req *http.Request) {
+	if len(g.cfg.MetricsFiles) == 0 {
+		http.NotFound(rw, req)
+		return
+	}
+	var all bytes.Buffer
+	for _, pattern := range g.cfg.MetricsFiles {
+		paths, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, p := range paths {
+			f, err := os.Open(p)
+			if err != nil {
+				continue
+			}
+			b, _ := io.ReadAll(io.LimitReader(f, 1<<20))
+			f.Close()
+			all.Write(b)
+			all.WriteByte('\n')
+		}
+	}
+	rw.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	rw.Write(RegroupMetrics(all.Bytes()))
 }
 
 // RegroupMetrics makes exporter output that repeats a metric's HELP/TYPE lines

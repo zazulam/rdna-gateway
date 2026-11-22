@@ -362,6 +362,23 @@ groups:
             datasourceUid: __expr__
             model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: lt, params: [1]}}]}
       - <<: *rule
+        uid: worker-restarting
+        title: Worker restarting repeatedly
+        for: 1m
+        annotations:
+          summary: "Worker {{ .Labels.worker }} was restarted more than twice in the last hour by its supervisor. Its crash copies (Windows) or journal (Linux) say why."
+        data:
+          - refId: A
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: prometheus
+            model:
+              refId: A
+              instant: true
+              expr: round(sum by (worker) (increase(worker_restarts_total[1h])))
+          - refId: C
+            datasourceUid: __expr__
+            model: {refId: C, type: threshold, expression: A, conditions: [{evaluator: {type: gt, params: [2]}}]}
+      - <<: *rule
         uid: gateway-down
         title: Gateway down
         for: 3m

@@ -15,7 +15,9 @@ func TestWriteReplacesTextfile(t *testing.T) {
 	d := hw.NewDevice("gpu0", "gpu")
 	for _, w := range []float64{20, 180} {
 		d.PowerW = w
-		if err := write(path, []*hw.Device{d}); err != nil {
+		var b strings.Builder
+		hw.Render(&b, []*hw.Device{d})
+		if err := write(path, []byte(b.String())); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -102,6 +102,16 @@ EOF
         labels: {host: "${DESKTOP_HOST:-desktop}"}
 EOF
   fi
+  if [[ "${GATEWAY_METRICS_FILES:-}" == yes ]]; then # supervise.ps1's restart metrics on the gateway host
+    cat <<EOF
+
+  - job_name: desktop-files
+    metrics_path: /metrics/files
+    static_configs:
+      - targets: ["$GATEWAY"]
+        labels: {host: "${DESKTOP_HOST:-desktop}"}
+EOF
+  fi
   if [[ -n "${WINDOWS_EXPORTER:-}" ]]; then
     cat <<EOF
 

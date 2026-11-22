@@ -38,6 +38,11 @@ type Config struct {
 	// LibreHardwareMonitor's sensors are also served as the shared hw_* series
 	// (internal/hw).
 	HostMetrics string `json:"host_metrics,omitempty"`
+	// MetricsFiles are Prometheus text files on this host to serve at
+	// /metrics/files, like node_exporter's textfile collector: e.g. the restart
+	// and model-load metrics workers/windows/supervise.ps1 writes. Each may be
+	// a glob. Missing files are skipped.
+	MetricsFiles []string `json:"metrics_files,omitempty"`
 	// OTLP exports a span per proxied request to an OpenTelemetry collector
 	// (OTLP/HTTP JSON). The standard OTEL_EXPORTER_OTLP_* and OTEL_SERVICE_NAME
 	// environment variables override it; with no endpoint, export is off.

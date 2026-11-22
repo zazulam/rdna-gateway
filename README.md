@@ -129,6 +129,12 @@ Ollama? `worker.ps1 -OllamaBlob <name>` or `install.sh ollama-blob <name>` print
 path, though the upstream GGUF is faster. For a model bigger than VRAM, add
 `--n-cpu-moe N` (MoE models) and find the best `N` with `bench/micro.sh`.
 
+To keep it running through crashes and hangs on Windows, run it under the supervisor
+instead: `.\workers\windows\supervise.ps1 -Name <worker> -Worker -RegisterTask` restarts it
+when it exits or fails three health checks, keeps a copy of its log from each crash, and
+writes restart and model-load metrics ([details](docs/HARDWARE-METRICS.md#worker-restarts-and-model-loads)).
+On Linux, systemd restarts it.
+
 Check it:
 
 ```sh
