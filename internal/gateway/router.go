@@ -41,6 +41,10 @@ type Worker struct {
 	cachedTokens atomic.Int64
 	outputTokens atomic.Int64
 
+	// Health transitions, for /metrics.
+	upChanges, downChanges atomic.Int64
+	lastChange             atomic.Int64 // unix nanoseconds; 0 = never changed
+
 	// Learned speeds (EWMA), guarded by mu. Seeded from Weight until observed.
 	prefillTPS float64 // uncached prompt tokens/s, as measured under real load
 	serviceS   float64 // seconds a request occupies a slot
