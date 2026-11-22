@@ -36,6 +36,7 @@ type Gateway struct {
 	client *http.Client
 	logf   func(string, ...any)
 	otel   *otlp.Exporter // nil when OpenTelemetry export is off
+	lat    *latency
 
 	routed map[string]*atomic.Int64 // by Decision.Reason
 }
@@ -67,6 +68,7 @@ func New(cfg *Config) (*Gateway, error) {
 			ResponseHeaderTimeout: 10 * time.Minute, // long prompts are processed before headers
 		}},
 		logf:   log.Printf,
+		lat:    newLatency(),
 		routed: map[string]*atomic.Int64{},
 	}
 	for _, k := range []string{"prefix", "least-loaded", "round-robin", "overflow", "retry", "cost", "fallback"} {
@@ -496,6 +498,7 @@ func (g *Gateway) serveMetrics(rw http.ResponseWriter) {
 		fmt.Fprintf(&b, "rdnagw_routed_total{reason=%q} %d\n", k, g.routed[k].Load())
 	}
 	fmt.Fprintf(&b, "rdnagw_prefix_nodes %d\n", g.index.Len())
+	g.lat.write(&b)
 	io.WriteString(rw, b.String())
 }
 

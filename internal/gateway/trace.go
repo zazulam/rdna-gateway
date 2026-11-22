@@ -304,6 +304,7 @@ func (c *call) end() {
 			c.fail(outcomeError, strconv.Itoa(c.status))
 		}
 	}
+	c.g.lat.record(c, time.Now())
 	if c.span == nil {
 		return
 	}
