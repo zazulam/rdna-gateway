@@ -217,6 +217,14 @@ list is labelled `other`, so client-chosen strings can't grow the label set.
 histogram_quantile(0.95, sum by (le, worker) (rate(gen_ai_server_time_to_first_token_seconds_bucket[5m])))
 ```
 
+Worker health changes are counted too, so a restart lines up against the failed request it
+caused: `rdnagw_worker_state_changes_total{worker, to="up|down"}` and
+`rdnagw_worker_last_change_timestamp_seconds{worker}` (0 until the first change). With
+[tracing](#tracing) on, each change is also an OTLP log record, `event.name` =
+`rdnagw.worker.state_change` with `worker`, `to` and `reason` (`health_ok`, `unreachable`,
+`timeout`, `unhealthy_status` while a model loads, `health_failed`, or the request error that
+marked it down).
+
 ### Tracing
 
 Set an OTLP endpoint and the gateway sends one OpenTelemetry span per proxied request,
@@ -232,7 +240,8 @@ extra dependencies. With no endpoint it stays off.
 The standard variables override the file: `OTEL_EXPORTER_OTLP_ENDPOINT`,
 `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`,
 `OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, and
-`OTEL_SDK_DISABLED=true` turns it off. Only `http/json` is spoken.
+`OTEL_SDK_DISABLED=true` turns it off; `OTEL_TRACES_EXPORTER=none` or `OTEL_LOGS_EXPORTER=none`
+turns off one signal. Only `http/json` is spoken.
 
 | Span attribute | From |
 |---|---|

@@ -101,7 +101,8 @@ func (g *Gateway) checkAll(ctx context.Context) {
 func (g *Gateway) check(ctx context.Context, w *Worker) {
 	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	ok := g.get(ctx, w.URL+"/health", nil) == nil
+	herr := g.get(ctx, w.URL+"/health", nil)
+	ok := herr == nil
 	if ok && len(w.WorkerConfig.Models) == 0 {
 		var lm struct {
 			Data []struct {
@@ -116,17 +117,59 @@ func (g *Gateway) check(ctx context.Context, w *Worker) {
 			w.setModels(ids)
 		}
 	}
-	was := w.healthy.Swap(ok)
-	if was != ok {
-		if ok {
-			// A worker coming back has (most likely) restarted with an empty cache.
-			g.index.ForgetWorker(w.Name)
-			g.logf("worker %s up (%v)", w.Name, w.Models())
-		} else {
-			g.logf("worker %s down", w.Name)
-		}
+	reason := "health_ok"
+	if !ok {
+		reason = healthFailure(herr)
 	}
+	g.setHealthy(w, ok, reason)
 }
+
+// setHealthy records a worker's health, and on a change counts it, stamps
+// the time and emits a state-change event. It reports whether it changed.
+func (g *Gateway) setHealthy(w *Worker, ok bool, reason string) bool {
+	if w.healthy.Swap(ok) == ok {
+		return false
+	}
+	to, sev := "down", otlp.SeverityWarn
+	if ok {
+		to, sev = "up", otlp.SeverityInfo
+		w.upChanges.Add(1)
+		// A worker coming back has (most likely) restarted with an empty cache.
+		g.index.ForgetWorker(w.Name)
+		g.logf("worker %s up (%v)", w.Name, w.Models())
+	} else {
+		w.downChanges.Add(1)
+		g.logf("worker %s down (%s)", w.Name, reason)
+	}
+	w.lastChange.Store(time.Now().UnixNano())
+	g.otel.Emit(otlp.LogRecord{
+		EventName:      "rdnagw.worker.state_change",
+		SeverityNumber: sev,
+		Body:           "worker " + w.Name + " " + to + " (" + reason + ")",
+		Attrs: []otlp.KeyValue{
+			otlp.String("worker", w.Name),
+			otlp.String("to", to),
+			otlp.String("reason", reason),
+		},
+	})
+	return true
+}
+
+// healthFailure names why a health check failed, without addresses.
+func healthFailure(err error) string {
+	var op *net.OpError
+	switch {
+	case errors.As(err, &op) && op.Op == "dial":
+		return "unreachable"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, errHealthStatus):
+		return "unhealthy_status" // llama-server answers 503 while loading a model
+	}
+	return "health_failed"
+}
+
+var errHealthStatus = errors.New("unexpected status")
 
 func (g *Gateway) get(ctx context.Context, url string, into any) error {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -137,7 +180,7 @@ func (g *Gateway) get(ctx context.Context, url string, into any) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		io.Copy(io.Discard, resp.Body)
-		return fmt.Errorf("%s: %s", url, resp.Status)
+		return fmt.Errorf("%s: %s: %w", url, resp.Status, errHealthStatus)
 	}
 	if into == nil {
 		io.Copy(io.Discard, resp.Body)
@@ -329,7 +372,7 @@ func (g *Gateway) forward(rw http.ResponseWriter, req *http.Request, body []byte
 		}
 		kind := classify(err)
 		if kind == retryOther {
-			w.healthy.Store(false) // the health loop brings it back
+			g.setHealthy(w, false, retryErrorType(err)) // the health loop brings it back
 		}
 		return kind, err
 	}
@@ -488,6 +531,13 @@ func (g *Gateway) serveMetrics(rw http.ResponseWriter) {
 		pp, svc := w.speeds()
 		gauge("worker_learned_prefill_tps", w.Name, fmt.Sprintf("%.1f", pp))
 		gauge("worker_learned_service_seconds", w.Name, fmt.Sprintf("%.2f", svc))
+		fmt.Fprintf(&b, "rdnagw_worker_state_changes_total{worker=%q,to=\"up\"} %d\n", w.Name, w.upChanges.Load())
+		fmt.Fprintf(&b, "rdnagw_worker_state_changes_total{worker=%q,to=\"down\"} %d\n", w.Name, w.downChanges.Load())
+		last := 0.0
+		if ns := w.lastChange.Load(); ns > 0 {
+			last = float64(ns) / 1e9
+		}
+		gauge("worker_last_change_timestamp_seconds", w.Name, strconv.FormatFloat(last, 'f', 3, 64))
 	}
 	reasons := make([]string, 0, len(g.routed))
 	for k := range g.routed {
