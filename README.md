@@ -196,6 +196,27 @@ Each response says where it went, in `X-Gateway-Worker`, `X-Gateway-Route` and
 The gateway also retries dropped keep-alive connections, aborts stalled streams, and
 exposes Prometheus metrics at `/metrics`.
 
+### Latency metrics
+
+Besides per-worker counters, `/metrics` has latency histograms named after the OpenTelemetry
+GenAI server metrics, labelled `worker`, `model`, `route` (the routing reason) and `outcome`
+(`ok`, `error`, `stalled`, `client_gone`):
+
+| Metric | Meaning | Buckets |
+|---|---|---|
+| `gen_ai_server_time_to_first_token_seconds` | streams: request accepted → first chunk carrying text, reasoning or a tool call | 0.05–60 s |
+| `gen_ai_server_time_per_output_token_seconds` | decode time ÷ output tokens, from llama-server's `timings.predicted_ms` | 1 ms–1 s |
+| `gen_ai_server_request_duration_seconds` | the whole request at the gateway, retries included | 0.1–600 s |
+| `rdnagw_queue_wait_seconds` | time not spent in the worker's prefill or decode: waiting for a slot, retries, network | 5 ms–60 s |
+
+Queue wait subtracts `timings.prompt_ms` (and for unstreamed requests `predicted_ms`) from the
+time the gateway saw, so it separates a busy worker from a slow one. A model a worker doesn't
+list is labelled `other`, so client-chosen strings can't grow the label set.
+
+```promql
+histogram_quantile(0.95, sum by (le, worker) (rate(gen_ai_server_time_to_first_token_seconds_bucket[5m])))
+```
+
 ### Tracing
 
 Set an OTLP endpoint and the gateway sends one OpenTelemetry span per proxied request,
