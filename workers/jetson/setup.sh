@@ -47,10 +47,11 @@ services)
   install -m 755 jetson-sensors.sh "$HOME/bin/jetson-sensors.sh"
   unit jetson-sensors "Jetson sensors for node_exporter" "$HOME/bin/jetson-sensors.sh"
   # hwmetrics (cmd/hwmetrics built for linux/arm64) adds the INA3221 board power
-  # and GPU load in the hw_* form the other hosts use.
+  # and GPU load in the hw_* form the other hosts use, and the two servers'
+  # restarts and model loads (worker names as in gateway.json).
   units="llama-embed llama-rerank jetson-sensors node-exporter"
   if [[ -x $HOME/bin/hwmetrics ]]; then
-    unit hw-metrics "Hardware metrics for node_exporter" "$HOME/bin/hwmetrics -textfile $HOME/.node-textfile/hw.prom -interval 15s"
+    unit hw-metrics "Hardware metrics for node_exporter" "$HOME/bin/hwmetrics -textfile $HOME/.node-textfile/hw.prom -interval 15s -worker jetson-embed=llama-embed.service,http://$HOST:8083 -worker jetson-rerank=llama-rerank.service,http://$HOST:8084"
     units="$units hw-metrics"
   else
     echo "optional: build cmd/hwmetrics for linux/arm64 into ~/bin for hw_* power metrics" >&2

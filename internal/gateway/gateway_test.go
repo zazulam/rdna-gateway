@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -340,6 +342,34 @@ func TestHostMetricsRelayAddsHW(t *testing.T) {
 		if !strings.Contains(string(b), want) {
 			t.Fatalf("missing %q in:\n%s", want, b)
 		}
+	}
+}
+
+func TestMetricsFiles(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "supervisor-a.prom"), []byte("# TYPE worker_restarts_total counter\nworker_restarts_total{worker=\"a\",reason=\"exit\"} 2\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "supervisor-b.prom"), []byte("# TYPE worker_restarts_total counter\nworker_restarts_total{worker=\"b\",reason=\"health\"} 1\n"), 0o644)
+	a := newFake(t, "a")
+	_, srv := newTestGateway(t, func(c *Config) {
+		c.MetricsFiles = []string{filepath.Join(dir, "supervisor-*.prom"), filepath.Join(dir, "missing.prom")}
+	}, a)
+	resp, err := http.Get(srv.URL + "/metrics/files")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	s := string(b)
+	if resp.StatusCode != http.StatusOK || strings.Count(s, "# TYPE worker_restarts_total") != 1 ||
+		!strings.Contains(s, `worker="a"`) || !strings.Contains(s, `worker="b"`) {
+		t.Fatalf("%d\n%s", resp.StatusCode, s)
+	}
+
+	_, srv2 := newTestGateway(t, nil, a)
+	resp, _ = http.Get(srv2.URL + "/metrics/files")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unset: want 404, got %d", resp.StatusCode)
 	}
 }
 

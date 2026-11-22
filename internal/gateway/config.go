@@ -35,8 +35,13 @@ type Config struct {
 	// on Windows. Its output is regrouped into valid Prometheus text, and
 	// LibreHardwareMonitor's sensors are also served as the shared hw_* series
 	// (internal/hw).
-	HostMetrics string         `json:"host_metrics,omitempty"`
-	Workers     []WorkerConfig `json:"workers"`
+	HostMetrics string `json:"host_metrics,omitempty"`
+	// MetricsFiles are Prometheus text files on this host to serve at
+	// /metrics/files, like node_exporter's textfile collector: e.g. the restart
+	// and model-load metrics workers/windows/supervise.ps1 writes. Each may be
+	// a glob. Missing files are skipped.
+	MetricsFiles []string       `json:"metrics_files,omitempty"`
+	Workers      []WorkerConfig `json:"workers"`
 }
 
 // WorkerConfig describes one llama-server (or any OpenAI-compatible) backend.

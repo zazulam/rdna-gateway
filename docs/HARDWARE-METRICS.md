@@ -1,5 +1,8 @@
 # Hardware metrics
 
+Power, GPU and temperature readings from every host, and (at the end) the supervisors' worker
+restarts and model loads.
+
 Every host publishes its power, GPU and temperature readings as the same Prometheus series,
 whatever its sensors are, so energy per request (or per agent run) is one query across the
 lab. The names follow the OpenTelemetry `hw.*` semantic conventions, with dots as
@@ -114,3 +117,34 @@ lab:power_watts:sum * on () clamp_max(net_grid_import_watts / (envoy_consumption
 
 is the lab's share of the grid draw, in watts, under the assumption that solar covers every
 load in the house in proportion.
+
+## Worker restarts and model loads
+
+The supervisors publish when a worker restarted and how long its model took to load, so a
+restart at 03:12 lines up with the failed request at 03:12.
+
+| Series | Meaning |
+|---|---|
+| `worker_restarts_total{worker, reason}` | Restarts by the supervisor: `exit` (the process died) or `health` (Windows only: three failed `/health` checks in a row, or still not healthy after `-LoadTimeoutSec`) |
+| `worker_last_restart_timestamp_seconds{worker}` | When the running process started, whatever started it |
+| `worker_model_load_seconds{worker}` | From process start to the first healthy `/health`, for the last load |
+| `worker_model_info{worker, model, ctx}` | Always 1: the loaded model's alias and its per-slot context size, from `/props` |
+
+`worker` is the worker's name in `gateway.json`.
+
+- **Windows:** `workers/windows/supervise.ps1` runs the process (llama-server from
+  `worker.ps1`'s saved config with `-Worker`, or anything else with `-Exe`), and writes
+  `supervisor-<name>.prom` to `$Root\metrics`. Set `"metrics_files"` in `gateway.json` to that
+  directory's `*.prom` and `GATEWAY_METRICS_FILES=yes` in `deploy/sff/.env`; the gateway serves
+  them at `/metrics/files`. Before each restart the process's log is copied to
+  `$Root\crash\<name>-<time>-<reason>.log` (the last 20 are kept); the supervisor's own log,
+  `supervise-<name>.log`, names that copy. The copy's contents stay on the box.
+- **Linux and Jetson:** systemd already restarts the units, so `hwmetrics -worker
+  name=unit,url` (`WORKERS=... workers/linux/install.sh metrics`) reads each unit's
+  `NRestarts` and start time from systemd, times loads against `/health` (every second while
+  a model loads), and writes `workers.prom` next to `hw.prom`. The crash output is in the
+  journal (`journalctl --user -u <unit>`). Restarts there are all `reason="exit"`.
+
+`worker_restarts_total` counts from when its supervisor started (systemd's `NRestarts`
+counts from when the unit was started), so read it with `increase()`. The "Worker restarting
+repeatedly" alert fires at more than two restarts in an hour.

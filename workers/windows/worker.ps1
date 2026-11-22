@@ -7,6 +7,7 @@
 #   .\worker.ps1 -Start / -Stop / -Status
 #   .\worker.ps1 -Start -Parallel 2 -Ctx 65536 -Kv q8_0 -Extra '--cache-ram 16384'
 #     (settings passed with -Start are saved for next time)
+#   .\worker.ps1 -PrintCommand   # the saved config as JSON {exe, args, port, log} (supervise.ps1 uses it)
 #
 # Why ROCm and not Vulkan: on a 6900 XT, ROCm+flash-attn processed prompts at
 # ~1370 tok/s vs ~900 for Vulkan (gemma4 12B Q4_0), same ~27 tok/s decode.
@@ -17,6 +18,7 @@ param(
   [switch]$Stop,
   [switch]$Status,
   [switch]$RegisterTask, # start the saved worker config at logon
+  [switch]$PrintCommand,
   [string]$OllamaBlob,
   [string]$Model,
   [string]$Alias,
@@ -43,7 +45,26 @@ function Resolve-OllamaBlob([string]$name) {
   "$models\blobs\" + ($layer.digest -replace ':', '-')
 }
 
+# The llama-server command line for a saved config.
+function Get-ServerCommand($c) {
+  $kvType = if ($c.kv) { $c.kv } else { 'q8_0' }
+  $reuse = if ($null -ne $c.cache_reuse) { $c.cache_reuse } else { 256 }
+  # -c is the total KV budget, split evenly across --parallel slots.
+  # q8_0 KV halves cache VRAM vs f16 with negligible quality loss, leaving room
+  # for more/longer slots on 12-16 GB cards. --cache-reuse lets a slot reuse
+  # shifted chunks of a previous prompt, not just an exact prefix.
+  $argv = @(
+    '-m', "`"$($c.model)`"", '--alias', $c.alias,
+    '-ngl', '999', '-fa', 'on', '-c', $c.ctx, '--parallel', $c.parallel,
+    '-ctk', $kvType, '-ctv', $kvType, '--cache-reuse', $reuse,
+    '--metrics', '--slots', '--host', '0.0.0.0', '--port', $c.port,
+    '--log-file', "`"$Root\server.log`"", $c.extra
+  ) -join ' '
+  [pscustomobject]@{ exe = (Join-Path $Root "$($c.backend)\llama-server.exe"); args = $argv; port = $c.port; log = "$Root\server.log"; kv = $kvType }
+}
+
 if ($OllamaBlob) { Resolve-OllamaBlob $OllamaBlob; return }
+if ($PrintCommand) { Get-ServerCommand (Get-Content -Raw $conf | ConvertFrom-Json) | ConvertTo-Json -Compress; return }
 
 if ($RegisterTask) {
   $script = $MyInvocation.MyCommand.Path
@@ -115,20 +136,8 @@ if ($Stop -or $Start) {
 
 if ($Start) {
   $c = Get-Content -Raw $conf | ConvertFrom-Json
-  $kvType = if ($c.kv) { $c.kv } else { 'q8_0' }
-  $reuse = if ($null -ne $c.cache_reuse) { $c.cache_reuse } else { 256 }
-  $exe = Join-Path $Root "$($c.backend)\llama-server.exe"
-  # -c is the total KV budget, split evenly across --parallel slots.
-  # q8_0 KV halves cache VRAM vs f16 with negligible quality loss, leaving room
-  # for more/longer slots on 12-16 GB cards. --cache-reuse lets a slot reuse
-  # shifted chunks of a previous prompt, not just an exact prefix.
-  $argv = @(
-    '-m', "`"$($c.model)`"", '--alias', $c.alias,
-    '-ngl', '999', '-fa', 'on', '-c', $c.ctx, '--parallel', $c.parallel,
-    '-ctk', $kvType, '-ctv', $kvType, '--cache-reuse', $reuse,
-    '--metrics', '--slots', '--host', '0.0.0.0', '--port', $c.port,
-    '--log-file', "`"$Root\server.log`"", $c.extra
-  ) -join ' '
+  $cmd = Get-ServerCommand $c
+  $exe, $argv, $kvType = $cmd.exe, $cmd.args, $cmd.kv
   # Win32_Process.Create escapes the SSH session's job object, so the server
   # survives the session closing.
   $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
