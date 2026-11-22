@@ -1,6 +1,7 @@
 // envoyexporter serves an Enphase IQ Gateway (Envoy) on the LAN as Prometheus
-// metrics: solar production, house consumption and grid import/export, read
-// from its local API every scrape.
+// metrics: solar production, house consumption, grid import/export and the net
+// grid import after solar (net_grid_import_watts), read from its local API
+// every scrape.
 //
 //	ENVOY_URL=https://192.168.1.50 ENVOY_TOKEN_FILE=envoy.token envoyexporter
 //
@@ -181,6 +182,12 @@ func Parse(p production) Reading {
 	return r
 }
 
+// GridImportW is the house's draw that solar isn't covering right now. Energy
+// used while it is 0 came from the panels, so it can be counted as free.
+func (r Reading) GridImportW() float64 {
+	return max(0, r.ConsumptionW-r.ProductionW)
+}
+
 func (c *client) read(ctx context.Context) (Reading, error) {
 	var p production
 	if err := c.get(ctx, "/production.json?details=1", &p); err != nil {
@@ -220,6 +227,7 @@ func Render(w io.Writer, r Reading, err error, took time.Duration) {
 	if r.HasConsumptionMeter {
 		g("envoy_consumption_watts", "Whole-house consumption now", r.ConsumptionW)
 		g("envoy_grid_watts", "Grid power now: positive = importing, negative = exporting", r.NetW)
+		g("net_grid_import_watts", "Power drawn from the grid after solar: max(0, consumption - production)", r.GridImportW())
 		fmt.Fprintf(w, "# TYPE envoy_consumption_wh_total counter\nenvoy_consumption_wh_total %g\n", r.ConsumptionWh)
 	}
 }

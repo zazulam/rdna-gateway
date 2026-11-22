@@ -34,7 +34,9 @@ type Config struct {
 	StallTimeout Duration `json:"stall_timeout,omitempty"`
 	// HostMetrics is a local exporter to relay at /metrics/host, e.g.
 	// LibreHardwareMonitor's "http://127.0.0.1:8085/metrics" for GPU temperatures
-	// on Windows. Its output is regrouped into valid Prometheus text.
+	// on Windows. Its output is regrouped into valid Prometheus text, and
+	// LibreHardwareMonitor's sensors are also served as the shared hw_* series
+	// (internal/hw).
 	HostMetrics string `json:"host_metrics,omitempty"`
 	// OTLP exports a span per proxied request to an OpenTelemetry collector
 	// (OTLP/HTTP JSON). The standard OTEL_EXPORTER_OTLP_* and OTEL_SERVICE_NAME

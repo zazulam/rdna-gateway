@@ -320,6 +320,29 @@ func TestHostMetricsRelay(t *testing.T) {
 	}
 }
 
+// LibreHardwareMonitor's sensors also come out as the hw_* series Linux hosts
+// write, alongside the original lhm_* ones.
+func TestHostMetricsRelayAddsHW(t *testing.T) {
+	host := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		io.WriteString(rw, "# TYPE lhm_gpuamd_power_watts gauge\n"+
+			`lhm_gpuamd_power_watts{"sensorName"="GPU Package", "hardwareId"="/gpu-amd/0", "host"="desktop"} 212.5`+"\n")
+	}))
+	defer host.Close()
+	a := newFake(t, "a")
+	_, srv := newTestGateway(t, func(c *Config) { c.HostMetrics = host.URL }, a)
+	resp, err := http.Get(srv.URL + "/metrics/host")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	for _, want := range []string{"lhm_gpuamd_power_watts{", `hw_power_watts{device="gpu0",kind="gpu"} 212.5`} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("missing %q in:\n%s", want, b)
+		}
+	}
+}
+
 func TestModelsAndAuth(t *testing.T) {
 	a := newFake(t, "a")
 	_, srv := newTestGateway(t, func(c *Config) { c.APIKey = "k" }, a)

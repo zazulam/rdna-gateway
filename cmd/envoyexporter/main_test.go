@@ -99,3 +99,23 @@ func TestSessionCookieFlow(t *testing.T) {
 		t.Fatal("missing token file should fail")
 	}
 }
+
+func TestNetGridImport(t *testing.T) {
+	// Exporting: solar covers everything, so nothing is imported.
+	var b strings.Builder
+	Render(&b, parse(t, withCTs), nil, time.Millisecond)
+	if !strings.Contains(b.String(), "net_grid_import_watts 0\n") {
+		t.Fatalf("exporting:\n%s", b.String())
+	}
+	// Evening: 1500 W used, 400 W from the panels.
+	r := Reading{ProductionW: 400, ConsumptionW: 1500, HasConsumptionMeter: true}
+	if got := r.GridImportW(); got != 1100 {
+		t.Fatalf("got %v", got)
+	}
+	// Without consumption CTs there's nothing to subtract from.
+	b.Reset()
+	Render(&b, parse(t, inverterOnly), nil, time.Millisecond)
+	if strings.Contains(b.String(), "net_grid_import_watts") {
+		t.Fatalf("no CTs:\n%s", b.String())
+	}
+}

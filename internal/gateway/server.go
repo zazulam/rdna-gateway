@@ -22,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zazulam/rdna-gateway/internal/hw"
 	"github.com/zazulam/rdna-gateway/internal/otlp"
 	"github.com/zazulam/rdna-gateway/internal/prefix"
 )
@@ -600,6 +601,9 @@ func (g *Gateway) serveHostMetrics(rw http.ResponseWriter, req *http.Request) {
 	}
 	rw.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	rw.Write(RegroupMetrics(body))
+	// The same readings in the hw_* form Linux hosts write (internal/hw), so
+	// power and GPU queries don't depend on which OS a host runs.
+	hw.Render(rw, hw.FromLHM(body))
 }
 
 // RegroupMetrics makes exporter output that repeats a metric's HELP/TYPE lines
