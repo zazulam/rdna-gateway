@@ -22,6 +22,9 @@ Tailscale. Only the Enphase IQ Gateway is LAN-only; the server box reads it over
 - **Monitoring:** Prometheus on the server box scrapes everything, including the desktop worker
   and LibreHardwareMonitor through the gateway's relays, both node_exporters and the Enphase
   exporter. Grafana shows the dashboard and sends alerts to ntfy.
+- **Traces (optional):** with `otlp` set in `gateway.json`, the gateway sends a span per
+  request (OTLP/HTTP JSON, GenAI semantic conventions) to any OTLP collector, and passes W3C
+  trace context on to the workers.
 
 ## Hive's offline harness
 
