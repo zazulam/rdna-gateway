@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -37,8 +38,34 @@ func (w *workerFlags) Set(v string) error {
 // unitShow returns a unit's properties (systemctl --user show). A variable so
 // tests can fake systemd.
 var unitShow = func(ctx context.Context, unit string) (map[string]string, error) {
-	out, err := exec.CommandContext(ctx, "systemctl", "--user", "show", "--timestamp=unix",
-		"-p", "NRestarts", "-p", "ExecMainStartTimestamp", "-p", "ExecMainPID", "-p", "Result", unit).Output()
+	props, err := systemctlShow(ctx, unit, !noUnixTimestamps.Load())
+	if err != nil && !noUnixTimestamps.Load() {
+		// systemd before 251 rejects --timestamp=unix; ask for the default
+		// format instead, and don't try the flag again.
+		if p, err2 := systemctlShow(ctx, unit, false); err2 == nil {
+			noUnixTimestamps.Store(true)
+			props, err = p, nil
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	if t, ok := props["ExecMainStartTimestamp"]; ok && !strings.HasPrefix(t, "@") {
+		props["ExecMainStartTimestamp"] = unixTimestamp(t, time.Local)
+	}
+	return props, nil
+}
+
+// noUnixTimestamps is set once systemctl has refused --timestamp=unix.
+var noUnixTimestamps atomic.Bool
+
+func systemctlShow(ctx context.Context, unit string, unix bool) (map[string]string, error) {
+	args := []string{"--user", "show"}
+	if unix {
+		args = append(args, "--timestamp=unix")
+	}
+	args = append(args, "-p", "NRestarts", "-p", "ExecMainStartTimestamp", "-p", "ExecMainPID", "-p", "Result", unit)
+	out, err := exec.CommandContext(ctx, "systemctl", args...).Output()
 	if err != nil {
 		return nil, err
 	}
@@ -49,6 +76,17 @@ var unitShow = func(ctx context.Context, unit string) (map[string]string, error)
 		}
 	}
 	return props, nil
+}
+
+// unixTimestamp converts systemd's default timestamp format ("Wed 2026-11-04
+// 20:15:11 EST", in the local zone) to the "@seconds" form --timestamp=unix
+// prints. Anything else (empty, "n/a") is returned unchanged.
+func unixTimestamp(t string, loc *time.Location) string {
+	tm, err := time.ParseInLocation("Mon 2006-01-02 15:04:05 MST", t, loc)
+	if err != nil {
+		return t
+	}
+	return "@" + strconv.FormatInt(tm.Unix(), 10)
 }
 
 // workerState is what the textfile reports for one worker.
