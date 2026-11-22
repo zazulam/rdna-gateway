@@ -10,7 +10,10 @@
 // SEARXNG_URL, EMBED_URL, EMBED_MODEL, RERANK_URL, RERANK_MODEL, RERANK_CANDIDATES
 // (default 20), QDRANT_URL, PROMETHEUS_URL (default http://127.0.0.1:9090) and
 // GRAFANA_DASHBOARDS (a directory of dashboard JSON; lab_dashboard is off without it).
-// The index subcommand reads RDNAMCP_TOKEN too.
+// The standard OpenTelemetry variables (OTEL_EXPORTER_OTLP_ENDPOINT,
+// OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_EXPORTER_OTLP_HEADERS, OTEL_SERVICE_NAME,
+// OTEL_RESOURCE_ATTRIBUTES, OTEL_SDK_DISABLED) turn on OTLP/HTTP traces; they're off
+// when unset. The index subcommand reads RDNAMCP_TOKEN too.
 package main
 
 import (
@@ -23,14 +26,17 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
 	"github.com/zazulam/rdna-gateway/internal/mcp"
+	"github.com/zazulam/rdna-gateway/internal/otlp"
 	"github.com/zazulam/rdna-gateway/internal/rag"
 	"github.com/zazulam/rdna-gateway/internal/tools"
 )
@@ -80,13 +86,30 @@ func serve() {
 	ts := append(toolset(r, searx), metricsTools(tools.NewProm(env("PROMETHEUS_URL", "http://127.0.0.1:9090")),
 		os.Getenv("GRAFANA_DASHBOARDS"))...)
 	s := &mcp.Server{Name: "rdnamcp", Version: "1.0", Token: token, Tools: ts}
+	exp := otlp.NewExporter(otlp.Config{}.WithEnv(os.Getenv), "github.com/zazulam/rdna-gateway/internal/mcp", "rdnamcp",
+		otlp.Options{Logf: log.Printf})
+	if exp.TracesEnabled() {
+		s.Tracer = otelTracer{exp}
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", s)
 	mux.HandleFunc("/metrics", s.Metrics)
 	mux.HandleFunc("/health", func(rw http.ResponseWriter, _ *http.Request) { rw.Write([]byte(`{"status":"ok"}`)) })
 	addr := env("RDNAMCP_LISTEN", "127.0.0.1:8090")
-	log.Printf("rdnamcp on %s (reranker: %v)", addr, r.R != nil)
-	log.Fatal((&http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}).ListenAndServe())
+	log.Printf("rdnamcp on %s (reranker: %v, traces: %v)", addr, r.R != nil, exp.TracesEnabled())
+	hs := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+		<-sig
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		hs.Shutdown(ctx)
+		exp.Shutdown(ctx) // send the spans still queued
+	}()
+	if err := hs.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
 }
 
 func schema(props map[string]any, required ...string) map[string]any {

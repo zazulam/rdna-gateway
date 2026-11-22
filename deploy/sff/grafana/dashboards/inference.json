@@ -1673,7 +1673,7 @@
       "uid": "prometheus"
      },
      "refId": "A",
-     "expr": "sum by (tool) (rate(rdnamcp_tool_calls_total[$__rate_interval]))",
+     "expr": "sum by (tool) (rate(mcp_server_tool_calls_total[$__rate_interval]))",
      "legendFormat": "{{tool}}"
     }
    ],
@@ -1689,7 +1689,7 @@
   },
   {
    "type": "timeseries",
-   "title": "Tool latency (mean)",
+   "title": "Tool latency (p95)",
    "datasource": {
     "type": "prometheus",
     "uid": "prometheus"
@@ -1820,7 +1820,7 @@
       "uid": "prometheus"
      },
      "refId": "A",
-     "expr": "sum by (tool) (rate(rdnamcp_tool_seconds_total[$__rate_interval])) / sum by (tool) (rate(rdnamcp_tool_calls_total[$__rate_interval]))",
+     "expr": "histogram_quantile(0.95, sum by (tool, le) (rate(mcp_server_operation_duration_seconds_bucket[$__rate_interval])))",
      "legendFormat": "{{tool}}"
     }
    ],
@@ -1878,7 +1878,7 @@
       "uid": "prometheus"
      },
      "refId": "A",
-     "expr": "sum by (tool) (increase(rdnamcp_tool_calls_total{result=\"error\"}[24h]))",
+     "expr": "sum by (tool) (increase(mcp_server_tool_calls_total{outcome=\"error\"}[24h]))",
      "legendFormat": "{{tool}}"
     }
    ],

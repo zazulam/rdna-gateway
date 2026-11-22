@@ -4,11 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/zazulam/rdna-gateway/internal/tracing"
 )
 
 var defaultClient = &http.Client{Timeout: 5 * time.Minute}
@@ -34,7 +39,7 @@ func postJSON(ctx context.Context, c *http.Client, method, url string, in, out a
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("%s %s: %s: %s", method, url, resp.Status, strings.TrimSpace(string(b)))
+		return &statusError{resp.StatusCode, fmt.Sprintf("%s %s: %s: %s", method, url, resp.Status, strings.TrimSpace(string(b)))}
 	}
 	if out == nil {
 		io.Copy(io.Discard, resp.Body)
@@ -42,6 +47,53 @@ func postJSON(ctx context.Context, c *http.Client, method, url string, in, out a
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
 }
+
+// peer is the server.address and server.port attributes for a client span.
+func peer(raw string) []tracing.Attr {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return nil
+	}
+	a := []tracing.Attr{tracing.String("server.address", u.Hostname())}
+	port := u.Port()
+	if port == "" && u.Scheme == "https" {
+		port = "443"
+	} else if port == "" {
+		port = "80"
+	}
+	if p, err := strconv.Atoi(port); err == nil {
+		a = append(a, tracing.Int("server.port", p))
+	}
+	return a
+}
+
+// endSpan records err's class (not its message, which can quote the input) and ends sp.
+func endSpan(sp tracing.Span, err error) {
+	if err != nil {
+		et := "error"
+		var ue *url.Error
+		var se *statusError
+		switch {
+		case errors.Is(err, context.DeadlineExceeded):
+			et = "timeout"
+		case errors.Is(err, context.Canceled):
+			et = "canceled"
+		case errors.As(err, &ue):
+			et = "connection_error"
+		case errors.As(err, &se):
+			et = strconv.Itoa(se.code)
+		}
+		sp.SetError(et)
+	}
+	sp.End()
+}
+
+type statusError struct {
+	code int
+	msg  string
+}
+
+func (e *statusError) Error() string { return e.msg }
 
 // Embedder calls an OpenAI-compatible /v1/embeddings endpoint (llama-server
 // with --embedding). Embedding models are trained with task prefixes; the
@@ -69,7 +121,20 @@ func NewEmbedder(url, model string) *Embedder {
 }
 
 // Embed returns one vector per text. query selects the query prefix.
-func (e *Embedder) Embed(ctx context.Context, texts []string, query bool) ([][]float32, error) {
+func (e *Embedder) Embed(ctx context.Context, texts []string, query bool) (_ [][]float32, err error) {
+	ctx, sp := tracing.Start(ctx, "embeddings "+e.Model, tracing.Client, append(peer(e.URL),
+		tracing.String("gen_ai.operation.name", "embeddings"), tracing.String("gen_ai.request.model", e.Model),
+		tracing.Int("rdnamcp.embeddings.inputs", len(texts)))...)
+	defer func() { endSpan(sp, err) }()
+	tokens, dims := 0, 0
+	defer func() {
+		if tokens > 0 {
+			sp.SetAttributes(tracing.Int("gen_ai.usage.input_tokens", tokens))
+		}
+		if dims > 0 {
+			sp.SetAttributes(tracing.Int("gen_ai.embeddings.dimension.count", dims))
+		}
+	}()
 	prefix := e.DocPrefix
 	if query {
 		prefix = e.QueryPrefix
@@ -86,6 +151,9 @@ func (e *Embedder) Embed(ctx context.Context, texts []string, query bool) ([][]f
 				Index     int       `json:"index"`
 				Embedding []float32 `json:"embedding"`
 			} `json:"data"`
+			Usage struct {
+				PromptTokens int `json:"prompt_tokens"`
+			} `json:"usage"`
 		}
 		if err := postJSON(ctx, e.Client, http.MethodPost, e.URL+"/v1/embeddings", map[string]any{"model": e.Model, "input": in}, &r); err != nil {
 			return nil, err
@@ -93,9 +161,14 @@ func (e *Embedder) Embed(ctx context.Context, texts []string, query bool) ([][]f
 		if len(r.Data) != len(batch) {
 			return nil, fmt.Errorf("embeddings: sent %d inputs, got %d vectors", len(batch), len(r.Data))
 		}
+		tokens += r.Usage.PromptTokens
 		vecs := make([][]float32, len(batch))
 		for _, d := range r.Data {
+			if d.Index < 0 || d.Index >= len(vecs) {
+				return nil, fmt.Errorf("embeddings: index %d out of range", d.Index)
+			}
 			vecs[d.Index] = d.Embedding
+			dims = len(d.Embedding)
 		}
 		out = append(out, vecs...)
 	}
@@ -113,7 +186,11 @@ func NewReranker(url, model string) *Reranker {
 }
 
 // Scores returns a relevance score per document, in input order.
-func (r *Reranker) Scores(ctx context.Context, query string, docs []string) ([]float64, error) {
+func (r *Reranker) Scores(ctx context.Context, query string, docs []string) (_ []float64, err error) {
+	ctx, sp := tracing.Start(ctx, "rerank "+r.Model, tracing.Client, append(peer(r.URL),
+		tracing.String("gen_ai.operation.name", "rerank"), tracing.String("gen_ai.request.model", r.Model),
+		tracing.Int("rdnamcp.rerank.documents", len(docs)))...)
+	defer func() { endSpan(sp, err) }()
 	var resp struct {
 		Results []struct {
 			Index int     `json:"index"`
@@ -182,12 +259,28 @@ func (s *Store) Drop(ctx context.Context, name string) error {
 }
 
 // DeleteSource removes every chunk stored for source.
-func (s *Store) DeleteSource(ctx context.Context, name, source string) error {
+func (s *Store) DeleteSource(ctx context.Context, name, source string) (err error) {
+	ctx, sp := s.dbSpan(ctx, "delete", name)
+	defer func() { endSpan(sp, err) }()
 	f := map[string]any{"filter": map[string]any{"must": []any{map[string]any{"key": "source", "match": map[string]any{"value": source}}}}}
 	return postJSON(ctx, s.Client, http.MethodPost, s.URL+"/collections/"+name+"/points/delete?wait=true", f, nil)
 }
 
-func (s *Store) Upsert(ctx context.Context, name string, pts []Point) error {
+// dbSpan starts a client span for one Qdrant operation, named per the
+// OpenTelemetry database conventions ("{operation} {collection}").
+func (s *Store) dbSpan(ctx context.Context, op, collection string, attrs ...tracing.Attr) (context.Context, tracing.Span) {
+	a := append(peer(s.URL), tracing.String("db.system.name", "qdrant"), tracing.String("db.operation.name", op))
+	name := op
+	if collection != "" {
+		a = append(a, tracing.String("db.collection.name", collection))
+		name += " " + collection
+	}
+	return tracing.Start(ctx, name, tracing.Client, append(a, attrs...)...)
+}
+
+func (s *Store) Upsert(ctx context.Context, name string, pts []Point) (err error) {
+	ctx, sp := s.dbSpan(ctx, "upsert", name, tracing.Int("db.operation.batch.size", len(pts)))
+	defer func() { endSpan(sp, err) }()
 	for i := 0; i < len(pts); i += 256 {
 		batch := pts[i:min(i+256, len(pts))]
 		if err := postJSON(ctx, s.Client, http.MethodPut, s.URL+"/collections/"+name+"/points?wait=true",
@@ -198,11 +291,16 @@ func (s *Store) Upsert(ctx context.Context, name string, pts []Point) error {
 	return nil
 }
 
-func (s *Store) Search(ctx context.Context, name string, vec []float32, limit int) ([]Hit, error) {
+func (s *Store) Search(ctx context.Context, name string, vec []float32, limit int) (_ []Hit, err error) {
+	ctx, sp := s.dbSpan(ctx, "search", name, tracing.Int("rdnamcp.search.limit", limit))
 	var r struct {
 		Result []Hit `json:"result"`
 	}
-	err := postJSON(ctx, s.Client, http.MethodPost, s.URL+"/collections/"+name+"/points/search",
+	defer func() {
+		sp.SetAttributes(tracing.Int("db.response.returned_rows", len(r.Result)))
+		endSpan(sp, err)
+	}()
+	err = postJSON(ctx, s.Client, http.MethodPost, s.URL+"/collections/"+name+"/points/search",
 		map[string]any{"vector": vec, "limit": limit, "with_payload": true}, &r)
 	return r.Result, err
 }

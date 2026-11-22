@@ -24,6 +24,15 @@ Tailscale. Only the Enphase IQ Gateway is LAN-only; the server box reads it over
   exporter. Each host's power and GPU readings arrive as the same `hw_*` series
   ([HARDWARE-METRICS.md](HARDWARE-METRICS.md)). Grafana shows the dashboard and sends alerts
   to ntfy.
+- **Traces (optional):** with `otlp` set in `gateway.json`, the gateway sends a span per
+  request (OTLP/HTTP JSON, GenAI semantic conventions) to any OTLP collector, and passes W3C
+  trace context on to the workers.
+- **Tool traces (optional):** with `OTEL_EXPORTER_OTLP_ENDPOINT` set, `rdnamcp` sends OTLP/HTTP
+  (JSON) traces to any OpenTelemetry receiver: one server span per MCP request
+  (`mcp.method.name`, `gen_ai.tool.name`, `mcp.session.id`, `jsonrpc.request.id`, `error.type`),
+  a child of the agent's own span when the request carries a `traceparent`, with client spans
+  below it for the embedder (`gen_ai.operation.name=embeddings`), the reranker and Qdrant
+  (`db.system.name=qdrant`). They carry counts and timings, not content.
 
 ## Hive's offline harness
 

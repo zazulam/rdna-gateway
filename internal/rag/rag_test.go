@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/zazulam/rdna-gateway/internal/tracing"
 )
 
 func TestChunkCoversTextWithOverlap(t *testing.T) {
@@ -118,6 +120,9 @@ func (f *fakeServices) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		for _, p := range pts {
 			f.pts[parts[1]][p.ID] = p
 		}
+	case len(parts) == 4 && parts[3] == "search" && f.pts[parts[1]] == nil:
+		http.NotFound(rw, r)
+		return
 	case len(parts) == 4 && parts[3] == "search":
 		b, _ := json.Marshal(in["vector"])
 		var q []float32
@@ -169,5 +174,62 @@ func TestIndexReplacesSourceAndSearchReranks(t *testing.T) {
 	hits, err = r.Search(ctx, "c", "banana cherry", 1)
 	if err != nil || len(hits) != 1 || hits[0].Source() != "b.md" && !strings.Contains(hits[0].Text(), "banana") {
 		t.Fatalf("reranked search: %v %+v", err, hits)
+	}
+}
+
+func TestRetrievalSpans(t *testing.T) {
+	const canary = "CANARY-4d2e-memory-text"
+	f := &fakeServices{pts: map[string]map[string]Point{}}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	rec := &tracing.Recorder{}
+	ctx, parent := rec.Start(context.Background(), "tools/call search_docs", tracing.Server, "")
+	r := &Retriever{E: NewEmbedder(srv.URL, "nomic-embed"), R: NewReranker(srv.URL, "rr"), S: NewStore(srv.URL), Candidates: 5, ChunkSize: 30, Overlap: 5}
+	if _, err := r.Index(ctx, "c", "a.md", "zebra apple "+canary+".\n\nbanana cherry.", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Search(ctx, "c", "zebra "+canary, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Search(ctx, "missing", canary, 2); err == nil {
+		t.Fatal("search of a missing collection should fail")
+	}
+	parent.End()
+	dump := rec.Dump()
+	if strings.Contains(dump, "CANARY") {
+		t.Fatalf("content leaked into spans:\n%s", dump)
+	}
+	var emb, rr, search, upsert *tracing.RecordedSpan
+	for _, s := range rec.Spans {
+		switch {
+		case s.Name == "embeddings nomic-embed" && s.Attrs["rdnamcp.embeddings.inputs"] == int64(1):
+			emb = s
+		case s.Name == "rerank rr":
+			rr = s
+		case s.Name == "search c":
+			search = s
+		case s.Name == "upsert c":
+			upsert = s
+		}
+		if s != parent && (s.Parent != parent || s.Kind != tracing.Client || !s.Ended) {
+			t.Fatalf("%s should be an ended client child of the tool span:\n%s", s.Name, dump)
+		}
+	}
+	if emb == nil || emb.Attrs["gen_ai.operation.name"] != "embeddings" || emb.Attrs["gen_ai.request.model"] != "nomic-embed" ||
+		emb.Attrs["gen_ai.embeddings.dimension.count"] != int64(26) || emb.Attrs["server.address"] != "127.0.0.1" {
+		t.Fatalf("embeddings span:\n%s", dump)
+	}
+	if rr == nil || rr.Attrs["rdnamcp.rerank.documents"].(int64) < 2 {
+		t.Fatalf("rerank span:\n%s", dump)
+	}
+	if search == nil || search.Attrs["db.system.name"] != "qdrant" || search.Attrs["db.operation.name"] != "search" ||
+		search.Attrs["db.collection.name"] != "c" || search.Attrs["db.response.returned_rows"].(int64) < 2 {
+		t.Fatalf("search span:\n%s", dump)
+	}
+	if upsert == nil || upsert.Attrs["db.operation.batch.size"].(int64) < 2 {
+		t.Fatalf("upsert span:\n%s", dump)
+	}
+	if s := rec.Find("search missing"); s == nil || s.ErrorType != "404" {
+		t.Fatalf("failed search should carry the status as error.type:\n%s", dump)
 	}
 }
