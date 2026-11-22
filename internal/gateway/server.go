@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/zazulam/rdna-gateway/internal/hw"
+	"github.com/zazulam/rdna-gateway/internal/otlp"
 	"github.com/zazulam/rdna-gateway/internal/prefix"
 )
 
@@ -37,9 +38,15 @@ type Gateway struct {
 	index  *prefix.Index
 	client *http.Client
 	logf   func(string, ...any)
+	otel   *otlp.Exporter // nil when OpenTelemetry export is off
+	lat    *latency
 
 	routed map[string]*atomic.Int64 // by Decision.Reason
 }
+
+// SetExporter sends a span per proxied request to e (nil turns it off).
+// Call before serving.
+func (g *Gateway) SetExporter(e *otlp.Exporter) { g.otel = e }
 
 // New builds a gateway from a normalized config.
 func New(cfg *Config) (*Gateway, error) {
@@ -64,6 +71,7 @@ func New(cfg *Config) (*Gateway, error) {
 			ResponseHeaderTimeout: 10 * time.Minute, // long prompts are processed before headers
 		}},
 		logf:   log.Printf,
+		lat:    newLatency(),
 		routed: map[string]*atomic.Int64{},
 	}
 	for _, k := range []string{"prefix", "least-loaded", "round-robin", "overflow", "retry", "cost", "fallback"} {
@@ -96,7 +104,8 @@ func (g *Gateway) checkAll(ctx context.Context) {
 func (g *Gateway) check(ctx context.Context, w *Worker) {
 	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	ok := g.get(ctx, w.URL+"/health", nil) == nil
+	herr := g.get(ctx, w.URL+"/health", nil)
+	ok := herr == nil
 	if ok && len(w.WorkerConfig.Models) == 0 {
 		var lm struct {
 			Data []struct {
@@ -111,17 +120,59 @@ func (g *Gateway) check(ctx context.Context, w *Worker) {
 			w.setModels(ids)
 		}
 	}
-	was := w.healthy.Swap(ok)
-	if was != ok {
-		if ok {
-			// A worker coming back has (most likely) restarted with an empty cache.
-			g.index.ForgetWorker(w.Name)
-			g.logf("worker %s up (%v)", w.Name, w.Models())
-		} else {
-			g.logf("worker %s down", w.Name)
-		}
+	reason := "health_ok"
+	if !ok {
+		reason = healthFailure(herr)
 	}
+	g.setHealthy(w, ok, reason)
 }
+
+// setHealthy records a worker's health, and on a change counts it, stamps
+// the time and emits a state-change event. It reports whether it changed.
+func (g *Gateway) setHealthy(w *Worker, ok bool, reason string) bool {
+	if w.healthy.Swap(ok) == ok {
+		return false
+	}
+	to, sev := "down", otlp.SeverityWarn
+	if ok {
+		to, sev = "up", otlp.SeverityInfo
+		w.upChanges.Add(1)
+		// A worker coming back has (most likely) restarted with an empty cache.
+		g.index.ForgetWorker(w.Name)
+		g.logf("worker %s up (%v)", w.Name, w.Models())
+	} else {
+		w.downChanges.Add(1)
+		g.logf("worker %s down (%s)", w.Name, reason)
+	}
+	w.lastChange.Store(time.Now().UnixNano())
+	g.otel.Emit(otlp.LogRecord{
+		EventName:      "rdnagw.worker.state_change",
+		SeverityNumber: sev,
+		Body:           "worker " + w.Name + " " + to + " (" + reason + ")",
+		Attrs: []otlp.KeyValue{
+			otlp.String("worker", w.Name),
+			otlp.String("to", to),
+			otlp.String("reason", reason),
+		},
+	})
+	return true
+}
+
+// healthFailure names why a health check failed, without addresses.
+func healthFailure(err error) string {
+	var op *net.OpError
+	switch {
+	case errors.As(err, &op) && op.Op == "dial":
+		return "unreachable"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, errHealthStatus):
+		return "unhealthy_status" // llama-server answers 503 while loading a model
+	}
+	return "health_failed"
+}
+
+var errHealthStatus = errors.New("unexpected status")
 
 func (g *Gateway) get(ctx context.Context, url string, into any) error {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -132,7 +183,7 @@ func (g *Gateway) get(ctx context.Context, url string, into any) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		io.Copy(io.Discard, resp.Body)
-		return fmt.Errorf("%s: %s", url, resp.Status)
+		return fmt.Errorf("%s: %s: %w", url, resp.Status, errHealthStatus)
 	}
 	if into == nil {
 		io.Copy(io.Discard, resp.Body)
@@ -205,6 +256,8 @@ func (g *Gateway) serveCompletion(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 	model, _ := parsed["model"].(string)
+	c := g.startCall(rw, req, parsed, model)
+	defer c.end()
 	policy := g.cfg.Policy
 	if h := req.Header.Get("X-Gateway-Policy"); h != "" {
 		if p, err := parsePolicy(h); err == nil {
@@ -230,6 +283,8 @@ func (g *Gateway) serveCompletion(rw http.ResponseWriter, req *http.Request) {
 		} else {
 			d, err = g.router.Pick(policy, model, chain, len(text), exclude)
 			if err != nil {
+				c.status = http.StatusServiceUnavailable
+				c.fail(outcomeError, "no_worker")
 				writeErr(rw, http.StatusServiceUnavailable, err.Error())
 				return
 			}
@@ -237,7 +292,8 @@ func (g *Gateway) serveCompletion(rw http.ResponseWriter, req *http.Request) {
 		if attempt > 0 {
 			d.Reason = "retry"
 		}
-		retry, err := g.forward(rw, req, body, chain, len(text), d)
+		c.attempt(d)
+		retry, err := g.forward(rw, req, body, chain, len(text), d, c)
 		if err == nil || retry == noRetry {
 			if err != nil {
 				g.logf("forward to %s: %v", d.Worker.Name, err)
@@ -246,10 +302,12 @@ func (g *Gateway) serveCompletion(rw http.ResponseWriter, req *http.Request) {
 		}
 		if retry == retrySame && again == nil {
 			g.logf("worker %s dropped the connection (%v); retrying it", d.Worker.Name, err)
+			c.retry(d.Worker.Name, "connection_dropped", true)
 			again = d.Worker
 			continue
 		}
 		g.logf("worker %s failed before responding (%v); trying another", d.Worker.Name, err)
+		c.retry(d.Worker.Name, retryErrorType(err), false)
 		again = nil
 		exclude[d.Worker] = true
 	}
@@ -262,6 +320,23 @@ const (
 	retrySame                   // connection dropped mid-handshake: worker is likely fine
 	retryOther                  // worker unreachable or not ready
 )
+
+var errUnavailable = errors.New("503 Service Unavailable")
+
+// retryErrorType names a failed attempt for telemetry, without addresses.
+func retryErrorType(err error) string {
+	if errors.Is(err, errUnavailable) {
+		return "503"
+	}
+	var op *net.OpError
+	if errors.As(err, &op) && op.Op == "dial" {
+		return "unreachable"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "connection_error"
+}
 
 // classify decides how to retry a transport error that happened before any
 // response bytes were written.
@@ -281,7 +356,7 @@ func classify(err error) retryKind {
 
 // forward proxies one request to d.Worker, streaming the response back.
 // retry=true means nothing was written to rw yet, so another worker may be tried.
-func (g *Gateway) forward(rw http.ResponseWriter, req *http.Request, body []byte, chain []uint64, promptChars int, d Decision) (retry retryKind, err error) {
+func (g *Gateway) forward(rw http.ResponseWriter, req *http.Request, body []byte, chain []uint64, promptChars int, d Decision, c *call) (retry retryKind, err error) {
 	w := d.Worker
 	started := time.Now()
 	w.inflight.Add(1)
@@ -295,15 +370,17 @@ func (g *Gateway) forward(rw http.ResponseWriter, req *http.Request, body []byte
 	if a := req.Header.Get("Accept"); a != "" {
 		up.Header.Set("Accept", a)
 	}
+	c.propagate(up.Header, req.Header)
 	resp, err := g.client.Do(up)
 	if err != nil {
 		w.failures.Add(1)
 		if req.Context().Err() != nil {
+			c.fail(outcomeClientGone, "client_gone")
 			return noRetry, err // client went away; don't blame the worker
 		}
 		kind := classify(err)
 		if kind == retryOther {
-			w.healthy.Store(false) // the health loop brings it back
+			g.setHealthy(w, false, retryErrorType(err)) // the health loop brings it back
 		}
 		return kind, err
 	}
@@ -312,10 +389,14 @@ func (g *Gateway) forward(rw http.ResponseWriter, req *http.Request, body []byte
 		// llama-server answers 503 while (re)loading a model.
 		w.failures.Add(1)
 		io.Copy(io.Discard, resp.Body)
-		return retryOther, errors.New(resp.Status)
+		return retryOther, errUnavailable
 	}
 
 	g.routed[d.Reason].Add(1)
+	c.status = resp.StatusCode
+	if ct := resp.Header.Get("Content-Type"); strings.HasPrefix(ct, "text/event-stream") {
+		c.stream = true
+	}
 	if resp.StatusCode == http.StatusOK {
 		// Record the prefix as soon as the worker accepts it, so a burst of
 		// requests sharing a system prompt converges on the same worker.
@@ -345,14 +426,16 @@ func (g *Gateway) forward(rw http.ResponseWriter, req *http.Request, body []byte
 		line, rerr := br.ReadBytes('\n')
 		stalled.Reset(stall)
 		if len(line) > 0 {
+			now := time.Now()
 			if _, werr := rw.Write(line); werr != nil {
+				c.fail(outcomeClientGone, "client_gone")
 				return noRetry, werr
 			}
 			if flusher != nil {
 				flusher.Flush()
 			}
-			if bytes.Contains(line, []byte(`"usage"`)) {
-				g.recordUsage(w, line, promptChars, time.Since(started))
+			if u, ok := c.observeLine(line, now); ok && u.HasUsage {
+				g.recordUsage(w, u, promptChars, now.Sub(started))
 			}
 		}
 		if rerr == io.EOF {
@@ -361,44 +444,31 @@ func (g *Gateway) forward(rw http.ResponseWriter, req *http.Request, body []byte
 		if rerr != nil {
 			if ctx.Err() != nil && req.Context().Err() == nil {
 				w.failures.Add(1)
+				c.fail(outcomeStalled, "stalled")
+				c.span.AddEvent("rdnagw.stall", otlp.String("server.address", w.Name),
+					otlp.Float("rdnagw.stall_timeout_s", stall.Seconds()))
 				return noRetry, fmt.Errorf("stream stalled for %s: %w", stall, rerr)
+			}
+			if req.Context().Err() != nil {
+				c.fail(outcomeClientGone, "client_gone")
+			} else {
+				c.fail(outcomeError, "stream_error")
 			}
 			return noRetry, rerr
 		}
 	}
 }
 
-// recordUsage pulls token counts out of a final SSE chunk or a whole JSON body.
-func (g *Gateway) recordUsage(w *Worker, line []byte, promptChars int, elapsed time.Duration) {
-	line = bytes.TrimSpace(bytes.TrimPrefix(bytes.TrimSpace(line), []byte("data:")))
-	var u struct {
-		Usage struct {
-			PromptTokens        int64 `json:"prompt_tokens"`
-			CompletionTokens    int64 `json:"completion_tokens"`
-			PromptTokensDetails struct {
-				CachedTokens int64 `json:"cached_tokens"`
-			} `json:"prompt_tokens_details"`
-		} `json:"usage"`
-		Timings *struct {
-			CacheN   int64   `json:"cache_n"`
-			PromptN  int64   `json:"prompt_n"`
-			PromptPS float64 `json:"prompt_per_second"`
-		} `json:"timings"`
+// recordUsage folds a worker's reported usage into the per-worker counters
+// and learned speeds.
+func (g *Gateway) recordUsage(w *Worker, u upstreamStats, promptChars int, elapsed time.Duration) {
+	if u.HasTimings {
+		w.observe(u.PromptN, u.PromptPS, elapsed.Seconds())
 	}
-	if json.Unmarshal(line, &u) != nil {
-		return
-	}
-	cached := u.Usage.PromptTokensDetails.CachedTokens
-	if u.Timings != nil && u.Timings.CacheN > cached {
-		cached = u.Timings.CacheN
-	}
-	if u.Timings != nil {
-		w.observe(u.Timings.PromptN, u.Timings.PromptPS, elapsed.Seconds())
-	}
-	g.router.observeCPT(int64(promptChars), u.Usage.PromptTokens)
-	w.promptTokens.Add(u.Usage.PromptTokens)
-	w.cachedTokens.Add(cached)
-	w.outputTokens.Add(u.Usage.CompletionTokens)
+	g.router.observeCPT(int64(promptChars), u.PromptTokens)
+	w.promptTokens.Add(u.PromptTokens)
+	w.cachedTokens.Add(u.CachedTokens)
+	w.outputTokens.Add(u.OutputTokens)
 }
 
 func (g *Gateway) serveModels(rw http.ResponseWriter) {
@@ -469,6 +539,13 @@ func (g *Gateway) serveMetrics(rw http.ResponseWriter) {
 		pp, svc := w.speeds()
 		gauge("worker_learned_prefill_tps", w.Name, fmt.Sprintf("%.1f", pp))
 		gauge("worker_learned_service_seconds", w.Name, fmt.Sprintf("%.2f", svc))
+		fmt.Fprintf(&b, "rdnagw_worker_state_changes_total{worker=%q,to=\"up\"} %d\n", w.Name, w.upChanges.Load())
+		fmt.Fprintf(&b, "rdnagw_worker_state_changes_total{worker=%q,to=\"down\"} %d\n", w.Name, w.downChanges.Load())
+		last := 0.0
+		if ns := w.lastChange.Load(); ns > 0 {
+			last = float64(ns) / 1e9
+		}
+		gauge("worker_last_change_timestamp_seconds", w.Name, strconv.FormatFloat(last, 'f', 3, 64))
 	}
 	reasons := make([]string, 0, len(g.routed))
 	for k := range g.routed {
@@ -479,6 +556,7 @@ func (g *Gateway) serveMetrics(rw http.ResponseWriter) {
 		fmt.Fprintf(&b, "rdnagw_routed_total{reason=%q} %d\n", k, g.routed[k].Load())
 	}
 	fmt.Fprintf(&b, "rdnagw_prefix_nodes %d\n", g.index.Len())
+	g.lat.write(&b)
 	io.WriteString(rw, b.String())
 }
 

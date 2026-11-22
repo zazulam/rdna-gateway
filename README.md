@@ -203,6 +203,73 @@ Each response says where it went, in `X-Gateway-Worker`, `X-Gateway-Route` and
 The gateway also retries dropped keep-alive connections, aborts stalled streams, and
 exposes Prometheus metrics at `/metrics`.
 
+### Latency metrics
+
+Besides per-worker counters, `/metrics` has latency histograms named after the OpenTelemetry
+GenAI server metrics, labelled `worker`, `model`, `route` (the routing reason) and `outcome`
+(`ok`, `error`, `stalled`, `client_gone`):
+
+| Metric | Meaning | Buckets |
+|---|---|---|
+| `gen_ai_server_time_to_first_token_seconds` | streams: request accepted → first chunk carrying text, reasoning or a tool call | 0.05–60 s |
+| `gen_ai_server_time_per_output_token_seconds` | decode time ÷ output tokens, from llama-server's `timings.predicted_ms` | 1 ms–1 s |
+| `gen_ai_server_request_duration_seconds` | the whole request at the gateway, retries included | 0.1–600 s |
+| `rdnagw_queue_wait_seconds` | time not spent in the worker's prefill or decode: waiting for a slot, retries, network | 5 ms–60 s |
+
+Queue wait subtracts `timings.prompt_ms` (and for unstreamed requests `predicted_ms`) from the
+time the gateway saw, so it separates a busy worker from a slow one. A model a worker doesn't
+list is labelled `other`, so client-chosen strings can't grow the label set.
+
+```promql
+histogram_quantile(0.95, sum by (le, worker) (rate(gen_ai_server_time_to_first_token_seconds_bucket[5m])))
+```
+
+Worker health changes are counted too, so a restart lines up against the failed request it
+caused: `rdnagw_worker_state_changes_total{worker, to="up|down"}` and
+`rdnagw_worker_last_change_timestamp_seconds{worker}` (0 until the first change). With
+[tracing](#tracing) on, each change is also an OTLP log record, `event.name` =
+`rdnagw.worker.state_change` with `worker`, `to` and `reason` (`health_ok`, `unreachable`,
+`timeout`, `unhealthy_status` while a model loads, `health_failed`, or the request error that
+marked it down).
+
+### Tracing
+
+Set an OTLP endpoint and the gateway sends one OpenTelemetry span per proxied request,
+following the [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/),
+so each inference call shows up inside the agent run that made it. It speaks OTLP/HTTP with
+JSON bodies, which any OTLP/HTTP receiver accepts (port 4318 on a collector), and needs no
+extra dependencies. With no endpoint it stays off.
+
+```json
+"otlp": { "endpoint": "http://100.64.0.20:4318", "service_name": "rdnagw" }
+```
+
+The standard variables override the file: `OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS`,
+`OTEL_EXPORTER_OTLP_TIMEOUT`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, and
+`OTEL_SDK_DISABLED=true` turns it off; `OTEL_TRACES_EXPORTER=none` or `OTEL_LOGS_EXPORTER=none`
+turns off one signal. Only `http/json` is spoken.
+
+| Span attribute | From |
+|---|---|
+| `gen_ai.operation.name`, `gen_ai.request.model`, `gen_ai.request.max_tokens` / `temperature` / `top_p` / `seed` | the request |
+| `gen_ai.response.model`, `gen_ai.response.id`, `gen_ai.response.finish_reasons` | the worker's response |
+| `gen_ai.usage.input_tokens`, `output_tokens`, `cache_read.input_tokens` | the usage block and llama-server's `timings` |
+| `gen_ai.server.time_to_first_token` | streams: request accepted → first chunk carrying text, reasoning or a tool call |
+| `server.address` | the worker's name from `gateway.json` |
+| `rdnagw.route`, `rdnagw.matched_blocks`, `rdnagw.retries`, `rdnagw.outcome` | the routing decision; outcome is `ok`, `error`, `stalled` or `client_gone` |
+| `error.type` | the status code, `stalled`, `client_gone`, `no_worker` or `stream_error` |
+
+Each retry is a `rdnagw.retry` span event (the failed worker and why) and a stalled stream
+adds a `rdnagw.stall` event. Spans never carry prompts, completions, tool arguments or tool
+results: only names, ids, counts and timings. They are batched in the background; if the
+collector is slow or down, spans are dropped rather than slowing requests.
+
+Trace context flows through: a caller's `traceparent` becomes the span's parent, `traceparent`
+(now the gateway's span), `tracestate` and `baggage` go on to the worker, and the response
+carries the span's `traceparent` next to `X-Gateway-Worker`. With tracing off, the caller's
+headers pass to the worker unchanged.
+
 ## Agent services
 
 The `deploy/sff` stack adds, on one Linux box:
@@ -235,6 +302,16 @@ The `deploy/sff` stack adds, on one Linux box:
 
   Index a folder from any machine:
   `rdnamcp index -url http://<box>:8090/mcp -collection docs <paths>`.
+
+  `rdnamcp` exposes `mcp_server_tool_calls_total{tool,outcome}` and the histogram
+  `mcp_server_operation_duration_seconds{tool}` at `/metrics`. Set
+  `OTEL_EXPORTER_OTLP_ENDPOINT` (and the other standard `OTEL_*` variables) to also send
+  OpenTelemetry traces to any OTLP/HTTP receiver: a span per MCP request following the
+  [MCP semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/mcp/),
+  parented by the caller's `traceparent` (from `params._meta` or the HTTP header) so it nests
+  under the agent's tool call, with child spans for embedding, reranking and Qdrant. Spans,
+  metrics and logs hold tool names, ids, counts, timings and error classes, never tool
+  arguments, results, queries, fetched pages or memories.
 
 The embedder and reranker are small llama.cpp servers. Run them next to the GPU worker:
 

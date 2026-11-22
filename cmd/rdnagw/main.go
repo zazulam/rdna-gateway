@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/zazulam/rdna-gateway/internal/gateway"
+	"github.com/zazulam/rdna-gateway/internal/otlp"
 )
 
 func main() {
@@ -38,19 +39,30 @@ func main() {
 		log.Fatal(err)
 	}
 
+	oc := cfg.OTLP.WithEnv(os.Getenv)
+	exp := otlp.NewExporter(oc, "github.com/zazulam/rdna-gateway/internal/gateway", "rdnagw", otlp.Options{Logf: log.Printf})
+	if exp != nil {
+		log.Printf("OpenTelemetry export on (traces %q, logs %q)", oc.TracesURL(), oc.LogsURL())
+	}
+	g.SetExporter(exp)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go g.Run(ctx)
 
 	srv := &http.Server{Addr: cfg.Listen, Handler: g, ReadHeaderTimeout: 10 * time.Second}
+	shutdown := make(chan struct{})
 	go func() {
+		defer close(shutdown)
 		<-ctx.Done()
 		sh, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		srv.Shutdown(sh)
+		exp.Shutdown(sh) // flush the last spans once requests have drained
 	}()
 	log.Printf("rdnagw listening on %s (%d workers, policy %s)", cfg.Listen, len(cfg.Workers), cfg.Policy)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+	<-shutdown
 }

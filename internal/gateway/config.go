@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/zazulam/rdna-gateway/internal/otlp"
 )
 
 // Config is the gateway's JSON config file.
@@ -40,8 +42,12 @@ type Config struct {
 	// /metrics/files, like node_exporter's textfile collector: e.g. the restart
 	// and model-load metrics workers/windows/supervise.ps1 writes. Each may be
 	// a glob. Missing files are skipped.
-	MetricsFiles []string       `json:"metrics_files,omitempty"`
-	Workers      []WorkerConfig `json:"workers"`
+	MetricsFiles []string `json:"metrics_files,omitempty"`
+	// OTLP exports a span per proxied request to an OpenTelemetry collector
+	// (OTLP/HTTP JSON). The standard OTEL_EXPORTER_OTLP_* and OTEL_SERVICE_NAME
+	// environment variables override it; with no endpoint, export is off.
+	OTLP    otlp.Config    `json:"otlp,omitempty"`
+	Workers []WorkerConfig `json:"workers"`
 }
 
 // WorkerConfig describes one llama-server (or any OpenAI-compatible) backend.

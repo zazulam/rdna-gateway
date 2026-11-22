@@ -165,6 +165,11 @@ services:
       RERANK_URL: ${RERANK_URL:-http://${BIND_IP}:8084}
       RERANK_MODEL: ${RERANK_ALIAS}
       RERANK_CANDIDATES: ${RERANK_CANDIDATES:-20}
+      # OpenTelemetry traces; off unless OTEL_EXPORTER_OTLP_ENDPOINT is set in .env.
+      OTEL_SERVICE_NAME: rdnamcp
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
+      OTEL_RESOURCE_ATTRIBUTES: ${OTEL_RESOURCE_ATTRIBUTES:-}
 
   # Push notifications for Grafana alerts. Subscribe in the ntfy phone app to
   # http://BIND_IP:8095/NTFY_TOPIC (the phone needs Tailscale). Message bodies
