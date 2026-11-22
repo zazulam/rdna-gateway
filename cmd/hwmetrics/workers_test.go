@@ -125,3 +125,25 @@ func TestWorkerWatcherAlreadyUp(t *testing.T) {
 		t.Fatalf("%s", b.String())
 	}
 }
+
+// systemd before 251 has no --timestamp=unix, so its default format is converted.
+func TestUnixTimestamp(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skip(err)
+	}
+	for in, want := range map[string]string{
+		"Wed 2026-11-04 20:15:11 EST": "@1793841311",
+		"Sat 2026-07-04 12:00:00 EDT": "@1783180800",
+		"":                            "",
+		"n/a":                         "n/a",
+	} {
+		if got := unixTimestamp(in, ny); got != want {
+			t.Errorf("unixTimestamp(%q) = %q, want %q", in, got, want)
+		}
+	}
+	utc := unixTimestamp("Wed 2026-11-04 20:15:11 UTC", time.UTC)
+	if utc != "@1793823311" {
+		t.Errorf("UTC: got %q", utc)
+	}
+}
