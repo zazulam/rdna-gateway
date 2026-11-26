@@ -308,7 +308,138 @@ def harness():
     s.write("hive-harness.svg")
 
 
+def repo_map():
+    s = Svg(1600, 910, "Repository map",
+            "What lives where, and how the parts meet at run time.")
+    # Workers
+    s.group(40, 130, 420, 310, "Workers (per OS)", TEAL)
+    s.card(60, 160, 380, "workers/windows", [
+        "worker.ps1: ROCm build, llama-server",
+        "supervise.ps1: restart on crash or hang",
+        "gateway.ps1: rdnagw as a logon task",
+    ], accent=TEAL, sub="PowerShell · logon tasks")
+    s.card(60, 306, 185, "workers/linux", [("install.sh", "mono"), "build · service · aux", "systemd user units"],
+           accent=TEAL)
+    s.card(255, 306, 185, "workers/jetson", [("setup.sh", "mono"), "embedder + reranker", "board sensors"],
+           accent=GREEN)
+    # Gateway
+    s.group(500, 130, 520, 310, "Gateway", CORAL)
+    s.card(520, 160, 480, "cmd/rdnagw", [
+        ("server.go: /v1/*, /metrics, relays", "mono"),
+        ("auto.go: auto model, rules, classifier", "mono"),
+        ("router.go: least-loaded, cache, cost", "mono"),
+        ("trace.go: spans, GenAI histograms", "mono"),
+    ], accent=CORAL, sub="internal/gateway")
+    for i, (t, ln) in enumerate([("internal/prefix", "prompt prefix index"), ("internal/otlp", "OTLP/HTTP JSON"),
+                                 ("internal/hw", "hw_* sensor series")]):
+        s.card(520 + i * 165, 326, 150, t, [ln], accent=CORAL, pad=14)
+    # Agent tools
+    s.group(1060, 130, 500, 310, "Agent tools", YELLOW)
+    s.card(1080, 160, 460, "cmd/rdnamcp", [
+        ("internal/mcp: MCP server, tool metrics", "mono"),
+        ("internal/rag: embed, Qdrant, rerank", "mono"),
+        ("internal/tools: search, fetch, metrics", "mono"),
+        ("internal/tracing: tool-call spans", "mono"),
+    ], accent=YELLOW, sub="MCP over HTTP · bearer token")
+    s.card(1080, 326, 460, "rdnamcp index", ["Index a folder into a collection from any machine"], accent=YELLOW)
+    # Run-time links between the top row
+    s.arrow([(520, 236), (444, 236)], CORAL, label="proxies", lx=482, ly=228)
+    s.arrow([(1310, 398), (1310, 466), (347, 466), (347, 418)], YELLOW, label="embed + rerank", lx=830, ly=462)
+    # Monitoring
+    s.group(40, 500, 620, 220, "Monitoring stack", GREEN)
+    s.card(60, 530, 280, "deploy/sff", [
+        ("docker-compose.yml", "mono"),
+        "up.sh: secrets, configs, start",
+        "prometheus/ · grafana/ · searxng/",
+    ], accent=GREEN, sub="one always-on Linux box")
+    for i, lab in enumerate(["Prometheus", "Grafana", "ntfy", "Qdrant", "SearXNG", "node_exporter"]):
+        s.pill(360 + (i % 2) * 145, 530 + (i // 2) * 40, lab, GREEN, w=130)
+    s.text(360, 668, "Scrapes /metrics of rdnagw, rdnamcp,", 12.5, MUTED)
+    s.text(360, 688, "workers (via relay) and the exporters", 12.5, MUTED)
+    # Exporters
+    s.group(700, 500, 360, 220, "Exporters", BLUE)
+    s.card(720, 530, 320, "cmd/hwmetrics", ["GPU and host power, VRAM, temps", "Shares internal/hw with rdnagw"],
+           accent=BLUE)
+    s.card(720, 634, 320, "cmd/envoyexporter", ["Solar gateway → Prometheus"], accent=BLUE)
+    s.arrow([(700, 610), (664, 610)], GREEN)
+    # Benchmarks
+    s.group(1100, 500, 460, 220, "Benchmarks", PURPLE)
+    s.card(1120, 530, 420, "cmd/rdnabench · cmd/ragbench", ["Agent-shaped load, retrieval bench"], accent=PURPLE)
+    s.card(1120, 614, 420, "bench/", [("lab.sh · micro.sh · rag.sh · models.sh", "mono"),
+                                      ("plot.py → docs/img/*.svg", "mono")], accent=PURPLE)
+    # Docs
+    s.group(40, 780, 1520, 90, "Docs", MUTED)
+    x = 64
+    for lab in ["README.md", "docs/ARCHITECTURE.md", "docs/BENCHMARKS.md", "docs/CONTEXT-MIGRATION.md",
+                "docs/HARDWARE-METRICS.md", "docs/diagrams/make.py → docs/img", "docs/deck (Marp)"]:
+        x += s.pill(x, 812, lab, FG) + 12
+    s.arrow([(1330, 720), (1330, 778)], PURPLE, label="charts", lx=1366, ly=754)
+    s.write("repo-map.svg")
+
+
+def request_flow():
+    s = Svg(1600, 860, "Inside rdnagw: one request",
+            "From the client to a llama-server worker and back, and what each step emits.")
+    top, h = 130, 176
+    s.card(40, top, 200, "Client", ["Any OpenAI client", ("POST /v1/chat/", "mono"), ("completions", "mono"),
+                                    "model: a name or auto"], accent=PURPLE, h=h)
+    s.card(280, top, 230, "Auth and limits", ["Bearer api_key, if set", "Body up to 64 MiB, JSON",
+                                              "X-Gateway-Policy override", "Span starts (traceparent)"],
+           accent=MUTED, h=h)
+    s.card(550, top, 300, "Model resolution", ["Named model: used as is", "auto: class, then target (below)",
+                                               "Body's model set to the target", "Prefix chain hashed for routing"],
+           accent=BLUE, h=h)
+    s.card(890, top, 330, "Router", ["Healthy workers serving the model;", "fallback workers only if none",
+                                     "least-loaded: in flight ÷ (slots × weight)", "ties: the worker with the warm prefix",
+                                     "or cache-aware, cost-aware, round-robin", "Retry: same worker, next, next model"],
+           accent=CORAL, h=h)
+    s.card(1260, top, 300, "Worker", ["llama-server, ROCm", "Prefix cache skips the shared prompt",
+                                      "Prefill, then decode in a slot", "503 while loading → retried elsewhere"],
+           accent=TEAL, sub="gemma4 · gpt-oss · lfm2", h=h)
+    for x1, x2 in ((240, 280), (510, 550), (850, 890), (1220, 1260)):
+        s.arrow([(x1, 190), (x2, 190)], MUTED)
+    s.arrow([(1260, 270), (1222, 270)], CORAL, dash="5 4")
+    # auto
+    s.group(550, 384, 1010, 160, "auto model", BLUE)
+    s.card(570, 412, 225, "1 · Affinity", ["Conversation key: header,", "or system + first message", "Pinned: reuse its model"],
+           accent=BLUE)
+    s.card(820, 412, 225, "2 · Rules", ["tools, small max_tokens,", "system prompt hints,", "code fence, long prompt"],
+           accent=BLUE)
+    s.card(1070, 412, 225, "3 · Classifier", ["lfm2:8b on a worker", "One word, 800 ms cap", "Timeout → default class"],
+           accent=YELLOW)
+    s.card(1320, 412, 220, "4 · Targets", ["Class models in order", "First with a healthy", "worker answers"],
+           accent=BLUE)
+    for x in (795, 1045, 1295):
+        s.arrow([(x, 468), (x + 25, 468)], BLUE)
+    s.arrow([(700, 306), (700, 410)], BLUE, label="model = auto", lx=700, ly=356)
+    s.arrow([(1430, 412), (1430, 350), (1055, 350), (1055, 308)], BLUE, label="target + fallbacks", lx=1240, ly=346)
+    # Return path
+    s.arrow([(1560, 218), (1584, 218), (1584, 580), (140, 580), (140, 308)], TEAL,
+            label="SSE or JSON back, OpenAI shape unchanged", lx=860, ly=576)
+    by = 620
+    s.card(40, by, 420, "Response headers", [
+        ("X-Gateway-Worker, X-Gateway-Model", "mono"),
+        ("X-Gateway-Route: least-loaded, prefix…", "mono"),
+        ("with auto: auto:<class>:<reason>", "mono"),
+        ("X-Gateway-Worker-Route: the worker pick", "mono"),
+        ("X-Gateway-Matched-Blocks, traceparent", "mono"),
+    ], accent=PURPLE, h=156)
+    s.card(500, by, 340, "Stream relay", ["Copied line by line, flushed", "Silent stream: aborted at stall_timeout",
+                                          "auto: model field → the real model", "Usage and timings read on the way"],
+           accent=TEAL, h=156)
+    s.card(880, by, 330, "Metrics (/metrics)", ["TTFT, per-token, duration, queue wait", "by worker, model, route, outcome",
+                                                "Routing and auto decision counts", "Classifier latency histogram"],
+           accent=GREEN, h=156)
+    s.card(1250, by, 310, "Traces and logs (OTLP)", ["One span per request, GenAI", "conventions: usage, TTFT, route",
+                                                     "Retry and stall span events", "Worker up/down log events"],
+           accent=GREEN, h=156)
+    s.text(800, 816, "No prompts or completions leave the gateway in telemetry: only names, counts and timings.",
+           14, MUTED, anchor="middle")
+    s.write("rdnagw-request-flow.svg")
+
 if __name__ == "__main__":
     topology()
     services()
     harness()
+    repo_map()
+    request_flow()
