@@ -40,6 +40,7 @@ type Gateway struct {
 	logf   func(string, ...any)
 	otel   *otlp.Exporter // nil when OpenTelemetry export is off
 	lat    *latency
+	auto   *autoRouter // nil unless the config has "auto"
 
 	routed map[string]*atomic.Int64 // by Decision.Reason
 }
@@ -73,6 +74,9 @@ func New(cfg *Config) (*Gateway, error) {
 		logf:   log.Printf,
 		lat:    newLatency(),
 		routed: map[string]*atomic.Int64{},
+	}
+	if cfg.Auto != nil {
+		g.auto = newAutoRouter(cfg.Auto)
 	}
 	for _, k := range []string{"prefix", "least-loaded", "round-robin", "overflow", "retry", "cost", "fallback"} {
 		g.routed[k] = new(atomic.Int64)
@@ -264,41 +268,90 @@ func (g *Gateway) serveCompletion(rw http.ResponseWriter, req *http.Request) {
 			policy = p
 		}
 	}
-	// Embeddings and rerank requests share no prefix state worth tracking.
-	var text string
-	var chain []uint64
-	if strings.HasSuffix(req.URL.Path, "completions") {
-		text = PromptText(parsed)
-		chain = g.index.Chain(text)
-	} else {
-		policy = PolicyLeastLoaded
+	completions := strings.HasSuffix(req.URL.Path, "completions")
+	if !completions {
+		policy = PolicyLeastLoaded // embeddings and rerank share no prefix state worth tracking
 	}
 
+	models := []string{model}
+	if g.auto != nil && model == g.auto.cfg.Model {
+		if !completions {
+			c.status = http.StatusBadRequest
+			c.fail(outcomeError, "auto_unsupported")
+			writeErr(rw, http.StatusBadRequest, fmt.Sprintf("model %q picks among chat models; name a model for %s", model, req.URL.Path))
+			return
+		}
+		ad := g.resolveAuto(req.Context(), req.Header, parsed)
+		c.setAuto(ad)
+		if len(ad.models) == 0 {
+			c.status = http.StatusServiceUnavailable
+			c.fail(outcomeError, "no_worker")
+			writeErr(rw, http.StatusServiceUnavailable, fmt.Sprintf("no healthy worker serves a model for %s", ad.label()))
+			return
+		}
+		models = ad.models
+	}
+
+	for i, m := range models {
+		b := body
+		if c.auto != nil {
+			if b, err = withModel(body, m); err != nil {
+				writeErr(rw, http.StatusBadRequest, "body is not a JSON object")
+				return
+			}
+			parsed["model"] = m
+		}
+		c.model = m
+		var text string
+		var chain []uint64
+		if completions {
+			text = PromptText(parsed)
+			chain = g.index.Chain(text)
+		}
+		var status int
+		status, err = g.serveModel(rw, req, b, policy, m, chain, len(text), c)
+		if err == nil {
+			if c.auto != nil && status == http.StatusOK {
+				g.auto.remember(c.auto.key, c.auto.class, m, time.Now())
+			}
+			return
+		}
+		if i+1 < len(models) {
+			g.logf("auto: %v; trying %s", err, models[i+1])
+		}
+	}
+	c.status = http.StatusServiceUnavailable
+	c.fail(outcomeError, "no_worker")
+	writeErr(rw, http.StatusServiceUnavailable, err.Error())
+}
+
+// serveModel sends one request for model to its workers, retrying as
+// needed. It returns an error only when no worker could take the request and
+// nothing has been written, so the caller can try another model.
+func (g *Gateway) serveModel(rw http.ResponseWriter, req *http.Request, body []byte, policy, model string, chain []uint64, promptChars int, c *call) (int, error) {
 	exclude := map[*Worker]bool{}
 	var again *Worker // retry this worker once (connection dropped, not down)
 	for attempt := 0; ; attempt++ {
 		var d Decision
+		var err error
 		if again != nil {
 			d = Decision{Worker: again}
 		} else {
-			d, err = g.router.Pick(policy, model, chain, len(text), exclude)
+			d, err = g.router.Pick(policy, model, chain, promptChars, exclude)
 			if err != nil {
-				c.status = http.StatusServiceUnavailable
-				c.fail(outcomeError, "no_worker")
-				writeErr(rw, http.StatusServiceUnavailable, err.Error())
-				return
+				return 0, err
 			}
 		}
 		if attempt > 0 {
 			d.Reason = "retry"
 		}
 		c.attempt(d)
-		retry, err := g.forward(rw, req, body, chain, len(text), d, c)
+		retry, err := g.forward(rw, req, body, chain, promptChars, d, c)
 		if err == nil || retry == noRetry {
 			if err != nil {
 				g.logf("forward to %s: %v", d.Worker.Name, err)
 			}
-			return
+			return c.status, nil
 		}
 		if retry == retrySame && again == nil {
 			g.logf("worker %s dropped the connection (%v); retrying it", d.Worker.Name, err)
@@ -410,7 +463,16 @@ func (g *Gateway) forward(rw http.ResponseWriter, req *http.Request, body []byte
 		}
 	}
 	h.Set("X-Gateway-Worker", w.Name)
-	h.Set("X-Gateway-Route", d.Reason)
+	if c.model != "" {
+		h.Set("X-Gateway-Model", c.model)
+	}
+	if c.auto != nil {
+		// The auto decision takes the route header; the worker pick moves aside.
+		h.Set("X-Gateway-Route", c.auto.label())
+		h.Set("X-Gateway-Worker-Route", d.Reason)
+	} else {
+		h.Set("X-Gateway-Route", d.Reason)
+	}
 	h.Set("X-Gateway-Matched-Blocks", strconv.Itoa(d.Matched))
 	rw.WriteHeader(resp.StatusCode)
 
@@ -427,6 +489,9 @@ func (g *Gateway) forward(rw http.ResponseWriter, req *http.Request, body []byte
 		stalled.Reset(stall)
 		if len(line) > 0 {
 			now := time.Now()
+			if c.auto != nil {
+				line = rewriteModel(line, c.model)
+			}
 			if _, werr := rw.Write(line); werr != nil {
 				c.fail(outcomeClientGone, "client_gone")
 				return noRetry, werr
@@ -499,6 +564,21 @@ func (g *Gateway) serveModels(rw http.ResponseWriter) {
 	for _, m := range byID {
 		out.Data = append(out.Data, m)
 	}
+	if g.auto != nil && byID[g.auto.cfg.Model] == nil {
+		am := &model{ID: g.auto.cfg.Model, Object: "model", OwnedBy: "rdna-gateway", Workers: []string{}}
+		for _, w := range g.router.workers {
+			if !w.healthy.Load() {
+				continue
+			}
+			for _, c := range g.auto.cfg.Classes {
+				if overlaps(c.Models, w.Models()) {
+					am.Workers = append(am.Workers, w.Name)
+					break
+				}
+			}
+		}
+		out.Data = append(out.Data, am)
+	}
 	sort.Slice(out.Data, func(i, j int) bool { return out.Data[i].ID < out.Data[j].ID })
 	writeJSON(rw, http.StatusOK, out)
 }
@@ -557,6 +637,9 @@ func (g *Gateway) serveMetrics(rw http.ResponseWriter) {
 	}
 	fmt.Fprintf(&b, "rdnagw_prefix_nodes %d\n", g.index.Len())
 	g.lat.write(&b)
+	if g.auto != nil {
+		g.auto.writeMetrics(&b)
+	}
 	io.WriteString(rw, b.String())
 }
 
@@ -706,6 +789,18 @@ func RegroupMetrics(in []byte) []byte {
 		}
 	}
 	return []byte(b.String())
+}
+
+// overlaps reports whether the two lists share an element.
+func overlaps(a, b []string) bool {
+	for _, x := range a {
+		for _, y := range b {
+			if x == y {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func writeJSON(rw http.ResponseWriter, status int, v any) {

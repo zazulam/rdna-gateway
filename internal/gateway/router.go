@@ -185,6 +185,20 @@ func (r *Router) candidates(model string, exclude map[*Worker]bool) (out []*Work
 	return nil, false
 }
 
+// available reports whether a healthy primary worker, or any healthy
+// worker at all, serves model.
+func (r *Router) available(model string) (primary, anyUp bool) {
+	for _, w := range r.workers {
+		if w.healthy.Load() && w.serves(model) {
+			if !w.Fallback {
+				return true, true
+			}
+			anyUp = true
+		}
+	}
+	return false, anyUp
+}
+
 // Pick chooses a worker for a prompt whose prefix chain is chain.
 //
 // cache-aware: go to the worker holding the longest cached prefix, unless it

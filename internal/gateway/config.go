@@ -46,7 +46,11 @@ type Config struct {
 	// OTLP exports a span per proxied request to an OpenTelemetry collector
 	// (OTLP/HTTP JSON). The standard OTEL_EXPORTER_OTLP_* and OTEL_SERVICE_NAME
 	// environment variables override it; with no endpoint, export is off.
-	OTLP    otlp.Config    `json:"otlp,omitempty"`
+	OTLP otlp.Config `json:"otlp,omitempty"`
+	// Auto, when present, serves a virtual model (default "auto") that picks
+	// a real model per request: cheap rules first, then a small classifier
+	// model. "auto": {} turns it on with the defaults (see AutoConfig).
+	Auto    *AutoConfig    `json:"auto,omitempty"`
 	Workers []WorkerConfig `json:"workers"`
 }
 
@@ -123,6 +127,11 @@ func (c *Config) normalize() error {
 	}
 	if len(c.Workers) == 0 {
 		return fmt.Errorf("config: no workers")
+	}
+	if c.Auto != nil {
+		if err := c.Auto.normalize(); err != nil {
+			return err
+		}
 	}
 	seen := map[string]bool{}
 	for i := range c.Workers {

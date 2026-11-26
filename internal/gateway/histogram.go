@@ -34,6 +34,8 @@ type histSeries struct {
 type histogram struct {
 	name, help string
 	bounds     []float64
+	// labels renders a series' label set; nil = worker, model, route, outcome.
+	labels func(histKey) string
 
 	mu     sync.Mutex
 	series map[histKey]*histSeries
@@ -85,6 +87,9 @@ func (h *histogram) write(b *strings.Builder) {
 	for _, k := range keys {
 		s := h.series[k]
 		labels := fmt.Sprintf("worker=%q,model=%q,route=%q,outcome=%q", k.worker, k.model, k.route, k.outcome)
+		if h.labels != nil {
+			labels = h.labels(k)
+		}
 		var cum uint64
 		for i, bound := range h.bounds {
 			cum += s.counts[i]
@@ -127,7 +132,7 @@ func (l *latency) record(c *call, end time.Time) {
 	if c.worker == nil {
 		return
 	}
-	k := histKey{worker: c.worker.Name, model: c.metricModel(), route: c.route, outcome: c.outcome}
+	k := histKey{worker: c.worker.Name, model: c.metricModel(), route: c.metricRoute(), outcome: c.outcome}
 	total := end.Sub(c.start).Seconds()
 	l.duration.observe(k, total)
 	ttft := c.ttft().Seconds()
@@ -152,7 +157,17 @@ func (l *latency) record(c *call, end time.Time) {
 	}
 }
 
-// metricModel is the requested model as a label, or "other" when the worker
+// metricRoute is the routing reason, or for the auto model its decision
+// ("auto:<class>:<reason>"): classes are configured and reasons a fixed set,
+// so the label set stays bounded.
+func (c *call) metricRoute() string {
+	if c.auto != nil {
+		return c.auto.label()
+	}
+	return c.route
+}
+
+// metricModel is the requested model (for auto, the model it chose) as a label, or "other" when the worker
 // doesn't list it, so arbitrary client strings can't grow the label set.
 func (c *call) metricModel() string {
 	for _, m := range c.worker.Models() {

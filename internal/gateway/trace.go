@@ -41,6 +41,16 @@ type call struct {
 
 	outcome   string
 	errorType string
+
+	auto *autoDecision // set when the request named the auto model
+}
+
+// setAuto records the auto model's decision on the call and its span.
+func (c *call) setAuto(d *autoDecision) {
+	c.auto = d
+	c.span.SetAttributes(
+		otlp.String("rdnagw.auto.class", d.class),
+		otlp.String("rdnagw.auto.reason", d.reason))
 }
 
 // operationName maps an endpoint to the GenAI operation it performs.
