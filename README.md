@@ -19,6 +19,12 @@ You can use it three ways:
 
 ![Service architecture: clients call one gateway, which routes to llama.cpp workers on two GPUs, a CPU and a Jetson; Prometheus and Grafana watch everything](docs/img/homelab-services.svg)
 
+How the repository fits together, and what the gateway does with one request:
+
+![Repository map: per-OS worker scripts, the rdnagw gateway and its internal packages, the rdnamcp agent tools, the monitoring stack, exporters, benchmarks and docs, with the run-time links between them](docs/img/repo-map.svg)
+
+![Request flow inside rdnagw: client, auth and limits, model resolution (for auto: affinity, rules, classifier, targets), router, worker, then the stream back with headers, metrics and traces](docs/img/rdnagw-request-flow.svg)
+
 ## What we learned
 
 The numbers are from this repo's own harness ([docs/BENCHMARKS.md](docs/BENCHMARKS.md)).
@@ -83,7 +89,7 @@ The numbers are from this repo's own harness ([docs/BENCHMARKS.md](docs/BENCHMAR
 | Part | What it does | Where |
 |---|---|---|
 | **Workers** | Install a llama.cpp ROCm build for gfx103X and run `llama-server` as a service | `workers/windows`, `workers/linux`, `workers/jetson` |
-| **Gateway** (`rdnagw`) | One OpenAI-compatible endpoint: routing, failover, retries, streaming, `/metrics` | `cmd/rdnagw`, `internal/gateway` |
+| **Gateway** (`rdnagw`) | One OpenAI-compatible endpoint: routing, failover, retries, streaming, automatic model choice, `/metrics` | `cmd/rdnagw`, `internal/gateway` |
 | **Agent tools** (`rdnamcp`) | MCP server: web search, page fetch, document search, memory, lab metrics | `cmd/rdnamcp`, `internal/{mcp,rag,tools}` |
 | **Monitoring stack** | Docker Compose: Prometheus, Grafana dashboard, alerts to your phone, Qdrant, SearXNG | `deploy/sff` |
 | **Hardware metrics** | GPU and host power, GPU load, VRAM and temperatures as the same `hw_*` series on every host | `cmd/hwmetrics`, `internal/hw` |
@@ -186,10 +192,93 @@ cd deploy/sff && cp .env.example .env && $EDITOR .env   # addresses, models, Gra
 ./up.sh                                                 # generates secrets, renders configs, starts
 ```
 
+## Automatic model choice (`auto`)
+
+Ask for the model `auto` and the gateway picks a real model for each request. Because it's
+just a model name, it works with any OpenAI-compatible client with no changes: an SDK,
+`curl`, or a Ligus agent pointed at the gateway.
+
+Turn it on with an `auto` block in `gateway.json`. `"auto": {}` takes every default, which
+are these:
+
+```json
+"auto": {
+  "model": "auto",
+  "classifier": "lfm2:8b",
+  "classifier_timeout": "800ms",
+  "default": "general",
+  "affinity_ttl": "30m",
+  "classes": [
+    { "name": "code",    "models": ["gpt-oss:20b", "gemma4:12b"],
+      "description": "programming, debugging, code review, shell commands, tool calling and agent steps",
+      "hints": ["coding assistant", "coding agent", "software engineer", "code review", "unified diff"] },
+    { "name": "general", "models": ["gemma4:12b", "gpt-oss:20b"],
+      "description": "explanations, writing, analysis, advice, long-form answers and ordinary conversation" },
+    { "name": "quick",   "models": ["lfm2:8b", "gemma4:12b"],
+      "description": "very short jobs: a title, a label, a yes/no, a one-line answer, classification or extraction",
+      "hints": ["generate a title", "short title", "one-liner", "one word", "classify"] }
+  ],
+  "rules": { "tools": "code", "short": "quick", "short_max_tokens": 64,
+             "code_fence": "code", "long": "general", "long_chars": 24000 }
+}
+```
+
+(The real default hint lists are a little longer; see `internal/gateway/auto.go`.)
+
+The gateway decides with the cheapest signal that settles it, in this order:
+
+| Step | Goes to | Reason |
+|---|---|---|
+| The conversation already has a model (same `X-Gateway-Session` header, or the same system prompt and first user message) | that model, while a worker serves it | `affinity` |
+| The request offers `tools`, or its history has tool calls or tool results | `rules.tools` | `tools` |
+| `max_tokens` is at most `short_max_tokens` | `rules.short` | `max_tokens` |
+| The system prompt contains one of a class's `hints` | that class | `hint` |
+| The latest user message has a ```` ``` ```` code block | `rules.code_fence` | `code_fence` |
+| The prompt is at least `long_chars` bytes | `rules.long` | `long` |
+| Otherwise: the classifier model answers with a class name | that class | `classifier` |
+
+The classifier is a model the gateway already serves (by default lfm2 on the CPU, which does
+this kind of job in 0.2–0.4 s, [benchmarks](docs/BENCHMARKS.md#quick-jobs-on-the-cpu)). It sees a
+fixed instruction listing the classes, then the first 1,500 bytes of the latest user message,
+and may write 8 tokens. If it takes longer than `classifier_timeout`, fails, has no healthy
+worker or answers something that isn't a class, the request goes to the `default` class with
+reason `classifier_timeout`, `classifier_error`, `classifier_unavailable` or
+`classifier_unsure`. `"classifier": "off"` skips it (`classifier_off`). Set any rule to `"off"`
+to disable it.
+
+The request then goes to the first model in the class's list that has a healthy worker
+(primary workers before `fallback` ones), then the default class's models. If every worker of
+that model fails before answering, the next model takes the request, so an unavailable target
+never blocks it. Only when no listed model has a healthy worker does the gateway answer 503.
+
+A conversation keeps the model that first answered it for `affinity_ttl` after its last turn,
+so a later turn that would classify differently (it grew long, or lost its code block) still
+lands where its prefix is cached. Pass `X-Gateway-Session: <id>` to key conversations
+explicitly. Affinity lives in the gateway's memory and resets when it restarts.
+
+What changes in the response:
+
+- The body keeps the OpenAI shape, streaming or not, with `model` set to the model that
+  answered (in every streamed chunk too).
+- `X-Gateway-Route` is `auto:<class>:<reason>`, e.g. `auto:code:tools`; the worker pick
+  (`least-loaded`, `prefix`, …) moves to `X-Gateway-Worker-Route`.
+- `X-Gateway-Model` names the model used (on every response, not only `auto`).
+- `/v1/models` lists `auto` next to the real models. `auto` is for chat and text
+  completions: embeddings and rerank requests for it get a 400.
+
+In `/metrics`, the latency histograms' `route` label is the auto decision
+(`route="auto:code:tools"`) and `model` is the model used, so you can compare classes and
+reasons. `rdnagw_auto_decisions_total{class, reason}` counts decisions, and
+`rdnagw_auto_classifier_duration_seconds{worker, model, outcome}` times the classifier
+(`outcome` is `ok`, `timeout`, `error` or `unsure`). Spans keep `gen_ai.request.model=auto`,
+report the real model as `gen_ai.response.model`, and add `rdnagw.auto.class` and
+`rdnagw.auto.reason`.
+
 ## How routing works
 
-Each response says where it went, in `X-Gateway-Worker`, `X-Gateway-Route` and
-`X-Gateway-Matched-Blocks`.
+Each response says where it went, in `X-Gateway-Worker`, `X-Gateway-Route`,
+`X-Gateway-Model` and `X-Gateway-Matched-Blocks`. (For the `auto` model, `X-Gateway-Route`
+carries its decision and the reasons below move to `X-Gateway-Worker-Route`.)
 
 | Policy / reason | When |
 |---|---|
@@ -206,7 +295,8 @@ exposes Prometheus metrics at `/metrics`.
 ### Latency metrics
 
 Besides per-worker counters, `/metrics` has latency histograms named after the OpenTelemetry
-GenAI server metrics, labelled `worker`, `model`, `route` (the routing reason) and `outcome`
+GenAI server metrics, labelled `worker`, `model`, `route` (the routing reason, or for `auto` its
+decision, `auto:<class>:<reason>`) and `outcome`
 (`ok`, `error`, `stalled`, `client_gone`):
 
 | Metric | Meaning | Buckets |
@@ -258,7 +348,8 @@ turns off one signal. Only `http/json` is spoken.
 | `gen_ai.server.time_to_first_token` | streams: request accepted → first chunk carrying text, reasoning or a tool call |
 | `server.address` | the worker's name from `gateway.json` |
 | `rdnagw.route`, `rdnagw.matched_blocks`, `rdnagw.retries`, `rdnagw.outcome` | the routing decision; outcome is `ok`, `error`, `stalled` or `client_gone` |
-| `error.type` | the status code, `stalled`, `client_gone`, `no_worker` or `stream_error` |
+| `rdnagw.auto.class`, `rdnagw.auto.reason` | the [`auto` model's](#automatic-model-choice-auto) decision, when it was asked for |
+| `error.type` | the status code, `stalled`, `client_gone`, `no_worker`, `stream_error` or `auto_unsupported` |
 
 Each retry is a `rdnagw.retry` span event (the failed worker and why) and a stalled stream
 adds a `rdnagw.stall` event. Spans never carry prompts, completions, tool arguments or tool
